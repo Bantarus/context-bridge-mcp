@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "context-bridge": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/context-bridge-mcp/dist/index.js"]
+    }
+  }
+}

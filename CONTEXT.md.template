@@ -1,0 +1,72 @@
+# Context Bridge — Project Skill File
+
+Copy this file to `<your-repo>/.context/CONTEXT.md` and fill in the sections below.
+
+---
+
+## What this project exposes
+
+**Project:** `<fill in — project name>`
+**Stack:** `<fill in — e.g. Node.js / TypeScript, Flutter / Dart, Python / FastAPI>`
+**Domains:** `<fill in — one bullet per .context/ subfolder>`
+
+- `api/` — API route handlers and middleware
+- `schemas/` — Data models and validation schemas
+- `events/` — Event definitions and handlers
+
+---
+
+## Rules for Claude Code
+
+### Rule 1 — Orient first
+Call `bridge_manifest()` at the start of every session.
+Never assume which domains exist.
+
+### Rule 2 — Fetch by domain
+Only fetch the domain relevant to what you are working on.
+Do not load all domains at once.
+
+| Working on                | Fetch                                                        |
+|---------------------------|--------------------------------------------------------------|
+| Any local component       | `bridge_get("<domain>", "<component>")`                      |
+| A cross-repo contract     | `bridge_get_contract("<name>")`                              |
+| Something in another repo | `bridge_get_from("<path>", "<domain>", "<component>")`       |
+| Discovery                 | `bridge_list()` or `bridge_list("<domain>")`                 |
+
+### Rule 3 — Contracts define boundaries
+Read the contract for any cross-repo interaction.
+Do not read another repo's internal domains unless debugging a mismatch.
+
+### Rule 4 — Write back after implementing
+After adding or changing anything described in `.context/`, update the file:
+```
+bridge_update("<domain>", "<component>", <content>)
+```
+
+### Rule 5 — Keep manifest current
+After creating a new domain or component, patch the manifest:
+```
+bridge_manifest_update({ patch: { domains: { "<domain>": ["<component>"] } } })
+```
+
+---
+
+## Context file format
+
+Each `.md` file in `.context/` follows this shape:
+
+```markdown
+# <Component name>
+
+## Purpose
+One sentence.
+
+## Interface / API surface
+What this exposes to other repos (endpoints, events, RPCs).
+
+## Internal notes
+What Claude Code should know before modifying this.
+
+## Last updated
+YYYY-MM-DD
+```
