@@ -7,7 +7,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { readFile, writeFile, readdir, mkdir, stat } from "fs/promises";
+import { readFile, writeFile, readdir, mkdir, stat, cp } from "fs/promises";
 import { join, resolve, relative } from "path";
 import { existsSync } from "fs";
 import { homedir } from "os";
@@ -29,6 +29,10 @@ const ECOSYSTEM_ROOT = resolve(
 );
 
 const ECOSYSTEM_PATH = join(ECOSYSTEM_ROOT, "ecosystem.json");
+
+// Skills shipped with this MCP server (relative to compiled dist/index.js)
+const SKILLS_SOURCE = resolve(import.meta.dirname, "..", ".claude", "skills");
+const BRIDGE_SKILLS = ["context-reader", "context-feeder", "context-bridge"];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -136,7 +140,7 @@ const ListSchema = z.object({
 });
 
 const GetFromSchema = z.object({
-  repo_path: z.string().min(1),
+  repo: z.string().min(1),
   domain: z.string().min(1),
   component: z.string().optional(),
 });
@@ -232,17 +236,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "bridge_get_from",
       description:
-        "Fetch a context file from another repo on this machine. " +
-        "Use when you need to read a domain from a different project without " +
-        "switching working directory. The other repo must have a .context/ folder.",
+        "Fetch a context file from another repo. " +
+        "Pass a registered ecosystem repo name (from bridge_discover) or a relative path. " +
+        "The other repo must have a .context/ folder.",
       inputSchema: {
         type: "object",
         properties: {
-          repo_path: {
+          repo: {
             type: "string",
             description:
-              "Absolute or relative path to the other repo root " +
-              "(e.g. '../other-service' or '/home/user/projects/api')",
+              "Ecosystem repo name (e.g. 'my-api') or relative path (e.g. '../my-api')",
           },
           domain: {
             type: "string",
@@ -254,7 +257,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               "File name without .md. Omit to list the domain directory.",
           },
         },
-        required: ["repo_path", "domain"],
+        required: ["repo", "domain"],
       },
     },
     {
@@ -335,6 +338,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: [],
       },
+    },
+    {
+      name: "bridge_sync_skills",
+      description:
+        "Install or update the companion Claude Code skills (context-reader, " +
+        "context-feeder, context-bridge) into the current repo's .claude/skills/ folder. " +
+        "Run once when onboarding a repo, or after updating the MCP server.",
+      inputSchema: { type: "object", properties: {}, required: [] },
     },
     {
       name: "bridge_manifest_update",
@@ -452,8 +463,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     // ── bridge_get_from ────────────────────────────────────────────────────
     case "bridge_get_from": {
-      const { repo_path, domain, component } = GetFromSchema.parse(args);
-      const externalRoot = resolve(process.cwd(), repo_path, ".context");
+      const { repo, domain, component } = GetFromSchema.parse(args);
+
+      // Resolve repo name from ecosystem, or treat as relative/absolute path
+      let repoRoot: string;
+      const ecosystem = await readEcosystem();
+      if (ecosystem.repos[repo]) {
+        repoRoot = resolve(ecosystem.repos[repo].path);
+      } else {
+        repoRoot = resolve(process.cwd(), repo);
+      }
+
+      const externalRoot = join(repoRoot, ".context");
       const path = contextPath(externalRoot, domain, component);
       assertSafePath(path, [externalRoot]);
 
@@ -462,7 +483,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!content) {
           throw new McpError(
             ErrorCode.InvalidParams,
-            `No file found: ${repo_path}/.context/${domain}/${component}.md`
+            `No file found: ${repo}/.context/${domain}/${component}.md`
           );
         }
         return { content: [{ type: "text", text: content }] };
@@ -476,7 +497,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             text:
               keys.length > 0
                 ? keys.map((k) => `  - .context/${domain}/${k}`).join("\n")
-                : `Domain .context/${domain} is empty or does not exist in ${repo_path}.`,
+                : `Domain .context/${domain} is empty or does not exist in ${repo}.`,
           },
         ],
       };
@@ -548,7 +569,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text",
-            text: `✓ Registered "${repoName}" at ${resolvedPath}\n  exposes: ${exposes.join(", ")}${stack ? `\n  stack: ${stack}` : ""}`,
+            text: `✓ Registered "${repoName}"\n  exposes: ${exposes.join(", ")}${stack ? `\n  stack: ${stack}` : ""}`,
           },
         ],
       };
@@ -572,7 +593,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const repoManifest = await safeRead(
           join(resolve(entry.path), ".context", "manifest.json")
         );
-        const detail: Record<string, unknown> = { ...entry };
+        // Return details without exposing the absolute path
+        const detail: Record<string, unknown> = {
+          name: repoName,
+          exposes: entry.exposes,
+          stack: entry.stack,
+          registeredAt: entry.registeredAt,
+        };
         if (repoManifest) {
           try {
             detail.manifest = JSON.parse(repoManifest);
@@ -601,7 +628,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const lines = repos.map(
         ([n, e]) =>
-          `  - ${n} (${e.stack ?? "unknown stack"})\n    path: ${e.path}\n    exposes: ${e.exposes.join(", ")}`
+          `  - ${n} (${e.stack ?? "unknown stack"})\n    exposes: ${e.exposes.join(", ")}`
       );
       return {
         content: [
@@ -651,6 +678,39 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           {
             type: "text",
             text: `✓ manifest.json updated.\n\n${JSON.stringify(merged, null, 2)}`,
+          },
+        ],
+      };
+    }
+
+    // ── bridge_sync_skills ────────────────────────────────────────────────
+    case "bridge_sync_skills": {
+      const targetRoot = join(process.cwd(), ".claude", "skills");
+      const results: string[] = [];
+
+      if (!existsSync(SKILLS_SOURCE)) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Skills source not found. Is the MCP server installed correctly?`
+        );
+      }
+
+      for (const skill of BRIDGE_SKILLS) {
+        const src = join(SKILLS_SOURCE, skill);
+        if (!existsSync(src)) continue;
+        const dest = join(targetRoot, skill);
+        await cp(src, dest, { recursive: true, force: true });
+        results.push(skill);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              results.length > 0
+                ? `✓ Synced ${results.length} skills to .claude/skills/:\n${results.map((s) => `  - ${s}`).join("\n")}`
+                : "No skills found to sync.",
           },
         ],
       };

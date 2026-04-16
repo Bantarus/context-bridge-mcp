@@ -79,7 +79,7 @@ For new repos, register in the ecosystem:
 ```
 bridge_register({
   name: "<repo-name>",
-  path: "<absolute-path>",
+  path: process.cwd(),
   exposes: ["contracts", "<domains>"],
   stack: "<tech stack>"
 })
@@ -184,11 +184,10 @@ Input: "Repo A sends `rank` as a string but repo B expects an int"
 2. bridge_discover()
 3. bridge_get("schemas", "<model>")        → this repo's type definition
 4. bridge_get_contract("<domain>")          → what shape the API declares
-5. bridge_discover("<other-repo>")          → get its path
-6. bridge_get_from("<path>", "schemas", "<model>")  → check the other side
-7. < fix the type in whichever repo is wrong >
-8. bridge_update("schemas", "<model>", <corrected definition>)
-9. bridge_update_contract("<domain>", <corrected shape if needed>)
+5. bridge_get_from("<other-repo>", "schemas", "<model>")  → check the other side (uses ecosystem name)
+6. < fix the type in whichever repo is wrong >
+7. bridge_update("schemas", "<model>", <corrected definition>)
+8. bridge_update_contract("<domain>", <corrected shape if needed>)
 ```
 
 **Example 3 — Adding a brand new cross-repo domain**
@@ -205,7 +204,7 @@ Input: "Add a real-time notifications system"
    }})
 6. bridge_register({
      name: "<this-repo>",
-     path: "<absolute-path>",
+     path: process.cwd(),
      exposes: [...existing, "contracts"],
      stack: "<stack>"
    })
@@ -247,7 +246,7 @@ Write context files for each component. At minimum, fill in Purpose and Exposes.
 ```
 bridge_register({
   name: "<repo-name>",
-  path: "<absolute-path-to-repo>",
+  path: process.cwd(),
   exposes: ["contracts", "<other-public-domains>"],
   stack: "<tech stack>"
 })
@@ -256,7 +255,16 @@ bridge_register({
 Include `"contracts"` in `exposes` so `bridge_get_contract` can auto-resolve
 contracts from this repo.
 
-### Step 4 — Verify discoverability
+### Step 4 — Install companion skills
+
+```
+bridge_sync_skills()
+```
+
+Copies context-reader, context-feeder, and context-bridge skills into this
+repo's `.claude/skills/`.
+
+### Step 5 — Verify discoverability
 
 From another repo, run:
 ```

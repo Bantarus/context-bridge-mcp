@@ -69,6 +69,7 @@ another repo and reads its `.context/` folder.
 | `bridge_get_contract` | Fetch a contract — searches local then ecosystem |
 | `bridge_update_contract` | Write a contract file |
 | `bridge_list_contracts` | List all contracts |
+| `bridge_sync_skills` | Install/update companion skills into current repo |
 | `bridge_manifest_update` | Deep-merge a patch into manifest.json |
 
 ---
@@ -106,7 +107,16 @@ mkdir -p .context/api
 echo '{"version":"1.0","domains":{"api":["routes"]}}' > .context/manifest.json
 ```
 
-3. Start using the bridge tools in Claude Code — call `bridge_manifest()` first
+3. Install the companion skills into the repo:
+
+```
+bridge_sync_skills()
+```
+
+This copies `context-reader`, `context-feeder`, and `context-bridge` skills
+into `.claude/skills/` so Claude Code knows how to use the bridge automatically.
+
+4. Start using the bridge tools in Claude Code — call `bridge_manifest()` first
 
 ---
 
@@ -262,6 +272,48 @@ bridge_manifest_update({ "patch": { "domains": { "routes": ["users", "billing", 
 - **Automate the write-back.** Use the `context-feeder` skill to automatically
   update context files after implementing. Context drift is the main failure
   mode of the bridge pattern.
+
+---
+
+## WSL + Windows cross-environment usage
+
+The bridge works between repos in the same environment (WSL-to-WSL or
+Windows-to-Windows) with no extra setup. Cross-environment usage (WSL repo
+talking to a Windows repo or vice versa) requires using cross-filesystem
+mount paths when registering.
+
+**If the MCP server runs in WSL**, register Windows projects via `/mnt/c/`:
+
+```
+bridge_register({
+  name: "my-windows-project",
+  path: "/mnt/c/Users/you/projects/my-app",
+  exposes: ["contracts", "api"],
+  stack: "..."
+})
+```
+
+**If the MCP server runs on Windows**, register WSL projects via the UNC path:
+
+```
+bridge_register({
+  name: "my-wsl-project",
+  path: "\\\\wsl$\\Ubuntu\\home\\you\\DEV\\my-app",
+  exposes: ["contracts"],
+  stack: "..."
+})
+```
+
+**Caveats:**
+
+- `/mnt/c/` access from WSL has a performance overhead (filesystem bridge)
+- File watching does not work across the boundary
+- Two separate Claude Code instances (one in WSL, one in Windows) need two
+  MCP server processes, but can share the same `ecosystem.json` by setting
+  `ECOSYSTEM_ROOT` to a path both environments can access
+
+**Recommendation:** keep all repos in the same environment (ideally WSL).
+Use cross-mount paths only when you have no choice.
 
 ---
 

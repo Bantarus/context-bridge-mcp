@@ -119,7 +119,7 @@ Start with whatever you just implemented. See file format below.
 ```typescript
 bridge_register({
   name: "<repo-name>",
-  path: "<absolute-path-to-repo>",
+  path: process.cwd(),
   exposes: ["contracts", "<other-public-domains>"],
   stack: "<tech stack>"
 })
@@ -128,6 +128,15 @@ bridge_register({
 This lets other repos discover this one via `bridge_discover()`.
 Include `"contracts"` in `exposes` if this repo has API contracts
 that other repos should be able to find automatically.
+
+**5. Install companion skills**
+
+```
+bridge_sync_skills()
+```
+
+This copies the context-reader, context-feeder, and context-bridge skills
+into this repo's `.claude/skills/` so Claude Code knows how to use the bridge.
 
 ---
 
@@ -168,7 +177,7 @@ Re-register to update the ecosystem:
 ```
 bridge_register({
   name: "<repo-name>",
-  path: "<absolute-path>",
+  path: process.cwd(),
   exposes: ["contracts", "<updated-domain-list>"],
   stack: "<stack>"
 })

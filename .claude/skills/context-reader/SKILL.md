@@ -92,14 +92,15 @@ repo owns the contract.
 ### Reading from another repo
 
 ```
-bridge_get_from("<path-to-repo>", "<domain>", "<component>")
+bridge_get_from("<repo-name>", "<domain>", "<component>")
 ```
+
+Pass the ecosystem repo name (from `bridge_discover`). The server resolves
+the path internally — you never need to know where the repo lives on disk.
 
 Use only when debugging a cross-repo mismatch or implementing something
 that requires understanding the other side's internals.
 Prefer `bridge_get_contract` for normal cross-repo work.
-
-Use `bridge_discover("<repo-name>")` to get the path if you don't know it.
 
 ### Discovering what exists
 
@@ -149,8 +150,8 @@ Need to understand the other side?
    YES                      NO
     │                       │
     ▼                       ▼
-bridge_discover("<repo>")
-then bridge_get_from()  Ready to act
+bridge_get_from("<repo>",
+"<domain>", "<comp>")  Ready to act
 ```
 
 ---
@@ -165,7 +166,7 @@ Example:
 > "I've loaded the matchmaking service context and the lobby contract.
 > The service exposes `findMatch`, `cancel`, and `status`. The contract
 > shows the client expects a `MATCH_FOUND` event with `{ matchId, players, startsInMs }`.
-> The ecosystem shows game-client is registered at ../game-client.
+> The ecosystem shows game-client is registered.
 > I'll now implement the timeout handling on the backend side."
 
 Do not skip this step. It is the cheapest bug fix in the workflow.
@@ -199,10 +200,8 @@ When a feature spans two repos, follow this sequence:
 4. bridge_get_contract("<domain>")
    → auto-resolved from local or ecosystem repos
 
-5. bridge_discover("<other-repo>")
-   → get path and details if you need internals
-   bridge_get_from("<path>", "<domain>", "<component>")
-   → only if contract is insufficient
+5. bridge_get_from("<other-repo>", "<domain>", "<component>")
+   → only if contract is insufficient (uses ecosystem repo name)
 ```
 
 Do NOT load the other repo's internal service or screen files unless the

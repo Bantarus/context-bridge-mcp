@@ -19,7 +19,7 @@ The project uses ESM (`"type": "module"`) with `tsconfig.json` targeting ES2022 
 
 ## Architecture
 
-The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 11 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories and a shared `ecosystem.json`.
+The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 12 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories and a shared `ecosystem.json`.
 
 **Key env vars:**
 - `CONTEXT_ROOT` — path to the `.context/` directory. Defaults to `$CWD/.context`.
@@ -45,6 +45,7 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 - `bridge_get_from` — read context files from another repo's `.context/` by path
 - `bridge_register` / `bridge_discover` — register repos in the ecosystem and discover them
 - `bridge_get_contract` / `bridge_update_contract` / `bridge_list_contracts` — read/write/list API contracts. `bridge_get_contract` searches local repo first, then all ecosystem repos that expose "contracts"
+- `bridge_sync_skills` — install/update companion skills (context-reader, context-feeder, context-bridge) into the current repo's `.claude/skills/`
 
 ### Security
 
