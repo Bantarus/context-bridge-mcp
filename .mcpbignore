@@ -1,0 +1,34 @@
+# Source — we ship dist/
+src/
+scripts/
+
+# Repo metadata
+.git/
+.gitignore
+.github/
+
+# Project state (not needed at runtime)
+.context/
+docs/
+
+# Build artifacts
+*.mcpb
+*.log
+.npmrc
+
+# Skill source — only ship the bridge's own companion skills
+.claude/skills/skill-creator/
+.claude/skills/mcp-builder/
+.claude/skills/docker-mcp-core/
+.claude/skills/docker-mcp-cli/
+.claude/skills/docker-mcp-toolkit/
+.claude/skills/docker-mcp-catalog/
+.claude/skills/docker-mcp-gateway/
+.claude/skills/docker-mcp-e2b/
+.claude/skills/apm-packaging/
+.claude/skills/apm-cli/
+.claude/skills/apm-distribution/
+
+# TypeScript artifacts
+tsconfig.json
+*.tsbuildinfo

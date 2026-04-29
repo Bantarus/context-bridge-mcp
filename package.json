@@ -4,10 +4,24 @@
   "description": "Context Bridge MCP — project-agnostic shared context layer for multi-repo projects",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "context-bridge-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "CONTEXT.md.template",
+    "README.md",
+    "claude.json.example",
+    ".claude/skills"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/add-shebang.js",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "prepublishOnly": "npm run build",
+    "pack:mcpb": "npx -y -p @anthropic-ai/mcpb@latest mcpb pack",
+    "validate:mcpb": "npx -y -p @anthropic-ai/mcpb@latest mcpb validate manifest.json",
+    "release:mcpb": "npm ci && npm run build && rm -rf node_modules && npm ci --omit=dev && npm run pack:mcpb && npm install"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

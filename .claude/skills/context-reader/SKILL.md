@@ -31,11 +31,12 @@ The manifest is always the first call. Everything else is selective.
 
 ---
 
-## Step 1 — Always: orient with manifest and ecosystem
+## Step 1 — Always: orient with manifest, ecosystem, and changes
 
 ```
 bridge_manifest()
 bridge_discover()
+bridge_changes()
 ```
 
 From the manifest, extract:
@@ -46,7 +47,11 @@ From the ecosystem, extract:
 - What other repos exist on this machine
 - What domains each repo exposes publicly
 
-Do not proceed until you've read both.
+From changes, extract:
+- What context or contracts changed in other repos since last session
+- Whether any of those changes affect what you're about to work on
+
+Do not proceed until you've read all three.
 
 ---
 
@@ -124,6 +129,7 @@ User describes a task
         ▼
 bridge_manifest()  ← always
 bridge_discover()  ← always
+bridge_changes()   ← always (shows what changed since last session)
         │
         ▼
 Does the task touch a specific component?
@@ -213,6 +219,7 @@ contract is insufficient to understand what you need to implement.
 
 - [ ] `bridge_manifest()` called and read
 - [ ] `bridge_discover()` called — aware of ecosystem repos
+- [ ] `bridge_changes()` called — aware of recent changes from other repos
 - [ ] Only task-relevant files fetched
 - [ ] Contract loaded if task crosses a repo boundary
 - [ ] Loaded context summarised to user

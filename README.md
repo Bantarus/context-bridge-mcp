@@ -6,7 +6,25 @@ context across multiple repos on the same machine. Each repo owns its own
 
 ---
 
-## Setup
+## Install
+
+Three install paths depending on your use case:
+
+### A. `.mcpb` bundle (one-click install in Claude Desktop and other MCPB-aware hosts)
+
+Build the bundle from source:
+
+```bash
+npm run release:mcpb
+# Produces: context-bridge-mcp.mcpb
+```
+
+Then drag the `.mcpb` file into Claude Desktop (or any host that implements the
+[MCPB spec](https://github.com/modelcontextprotocol/mcpb)). The host will prompt
+for the **Ecosystem Root** (defaults to `~/.context-bridge`) and wire everything
+up. No manual config.
+
+### B. Claude Code CLI (manual stdio registration)
 
 ```bash
 npm install
@@ -29,6 +47,15 @@ claude mcp add --scope user --transport stdio context-bridge \
 ```
 
 Or use `claude.json.example` as a template for per-repo configuration.
+
+### C. Embed in a host application (Electron operator gateway, IDE plugin, etc.)
+
+```bash
+npm install context-bridge-mcp
+```
+
+See [Embedding in a host application](#embedding-in-a-host-application) below for
+the spawn pattern.
 
 ---
 
@@ -69,6 +96,7 @@ another repo and reads its `.context/` folder.
 | `bridge_get_contract` | Fetch a contract — searches local then ecosystem |
 | `bridge_update_contract` | Write a contract file |
 | `bridge_list_contracts` | List all contracts |
+| `bridge_changes` | Show changes from other repos since last check |
 | `bridge_sync_skills` | Install/update companion skills into current repo |
 | `bridge_manifest_update` | Deep-merge a patch into manifest.json |
 
@@ -204,15 +232,31 @@ on the machine can see each other without hardcoded paths.
 
 **3. Claude Code reads context at the start of a session**
 
-When you start working, Claude Code calls `bridge_manifest()` to see what
-domains exist, then fetches only the ones relevant to the task:
+When you start working, Claude Code orients itself, checks for changes, then
+fetches only the context relevant to the task:
 
 ```
 bridge_manifest()              ← what domains does this repo have?
 bridge_discover()              ← what other repos exist in the ecosystem?
+bridge_changes()               ← what changed in other repos since last session?
 bridge_get("routes", "users")  ← fetch the context I need
 bridge_get_contract("users")   ← resolved automatically from ecosystem
 ```
+
+`bridge_changes` is filtered by `watches` in your manifest. If you declare
+watches, you only see changes from the repos and domains you care about:
+
+```json
+{
+  "watches": {
+    "my-api": ["contracts", "schemas"],
+    "shared-lib": ["events"]
+  }
+}
+```
+
+If no watches are declared, `bridge_changes` shows all contract changes from
+other repos as a safe default.
 
 `bridge_get_contract` is ecosystem-aware: it searches the current repo first,
 then all ecosystem repos that expose `contracts`. No need to know which repo
@@ -260,6 +304,35 @@ bridge_manifest_update({ "patch": { "domains": { "routes": ["users", "billing", 
 | Debugging a mismatch between repos | `bridge_get_from` (peek at their internals) |
 | Implementing against a stable interface | `bridge_get_contract` |
 | Understanding how another repo works internally | `bridge_get_from` |
+
+### Contract version tracking
+
+Every contract must have a `## Version` section:
+
+```markdown
+# Contract: users
+
+## Version
+2.1
+
+## Changelog
+- 2026-04-21: Added rate limit header
+- 2026-04-15: Initial contract
+```
+
+When a repo reads a contract via `bridge_get_contract`, the bridge automatically
+pins the consumed version in the ecosystem. On the next session start,
+`bridge_changes` compares the pinned version against the current version and
+warns about drift:
+
+```
+Version drift detected (1):
+
+  ⚠ contract "users": you consumed v2.0 from my-api on 2026-04-15, current is v2.1
+```
+
+This means the agent knows exactly what changed and can re-fetch the contract
+to understand the delta before writing any code against a stale interface.
 
 ### Tips
 
@@ -314,6 +387,143 @@ bridge_register({
 
 **Recommendation:** keep all repos in the same environment (ideally WSL).
 Use cross-mount paths only when you have no choice.
+
+---
+
+## Embedding in a host application
+
+Context Bridge MCP can be embedded as a child process inside any host that
+speaks MCP — Electron operator gateways, IDE plugins, custom orchestrators.
+This is the same pattern Claude Code, Cursor, Continue, and Zed use for
+native MCPs.
+
+### Install
+
+Either depend on it via npm:
+
+```bash
+npm install context-bridge-mcp
+```
+
+Or bundle the compiled `dist/` folder directly with your app's resources.
+
+### Spawn pattern (with `@modelcontextprotocol/sdk`)
+
+The cleanest path is to let the MCP SDK manage the child process via
+`StdioClientTransport`:
+
+```ts
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { app } from "electron";
+import { resolve } from "node:path";
+
+// Resolve to the bundled or installed binary
+const binary = resolve(
+  app.getAppPath(),
+  "node_modules/context-bridge-mcp/dist/index.js"
+);
+
+const transport = new StdioClientTransport({
+  command: process.execPath,        // Electron's bundled Node
+  args: [binary],
+  env: {
+    ...process.env,
+    // Persistent state under the host's user data dir
+    ECOSYSTEM_ROOT: resolve(app.getPath("userData"), "context-bridge"),
+    // Override per active workspace if needed
+    CONTEXT_ROOT: resolve(activeRepoPath, ".context"),
+  },
+  cwd: activeRepoPath,              // .context/ is read from cwd by default
+});
+
+const client = new Client({ name: "operator-gateway", version: "1.0.0" }, {});
+await client.connect(transport);
+
+// Now call tools
+const manifest = await client.callTool({ name: "bridge_manifest", arguments: {} });
+```
+
+### Manual spawn (full lifecycle control)
+
+If you need to manage the process yourself (custom restart logic,
+crash supervision, log capture):
+
+```ts
+import { spawn } from "node:child_process";
+
+const proc = spawn(process.execPath, [binary], {
+  stdio: ["pipe", "pipe", "pipe"],
+  cwd: activeRepoPath,
+  env: {
+    ...process.env,
+    ECOSYSTEM_ROOT: resolve(app.getPath("userData"), "context-bridge"),
+  },
+});
+
+proc.stderr.on("data", (chunk) => {
+  // Server logs (boot info, warnings) go to stderr
+  console.log("[context-bridge]", chunk.toString());
+});
+
+// Wire proc.stdin / proc.stdout to your MCP client transport
+// Handle proc.on("exit", ...) for restart logic
+// Call proc.kill() in app.on("before-quit", ...)
+```
+
+### Environment variables an embedding host should set
+
+| Var | Purpose | Recommended value |
+|-----|---------|-------------------|
+| `ECOSYSTEM_ROOT` | Where `ecosystem.json` and `changelog.jsonl` live | `app.getPath("userData") + "/context-bridge"` (or shared across all your app instances) |
+| `CONTEXT_ROOT` | Override the `.context/` location | Usually unset — `process.cwd() + "/.context"` is correct when you set `cwd` |
+| `CONTRACTS_ROOT` | Override contracts location | Set if you want a shared contracts folder across multiple repos |
+
+### Switching active workspaces
+
+The bridge resolves `.context/` from `process.cwd()`. To switch active
+workspaces in your host app, you have two options:
+
+1. **Restart the child process** with a new `cwd` — clean state, simple,
+   takes ~50ms. Recommended for most operator gateways.
+2. **Set `CONTEXT_ROOT` per-call via env** — not currently supported, would
+   require an architectural change to make the tools accept a workspace
+   argument.
+
+### Cross-platform notes
+
+- Use `process.execPath` rather than `"node"` so you get the Electron-bundled
+  Node runtime (no system Node dependency for end users)
+- On Windows, `node_modules/.bin/context-bridge-mcp` resolves to a `.cmd`
+  shim — prefer the direct path to `dist/index.js` for spawning
+- The shebang line works on POSIX systems if you mark the file executable
+  (npm install does this automatically via the `bin` field)
+
+---
+
+## Building the `.mcpb` bundle
+
+Context Bridge ships an [MCPB manifest](https://github.com/modelcontextprotocol/mcpb)
+at the repo root (`manifest.json`) so it can be packaged as a single `.mcpb` file
+for one-click install in Claude Desktop and other MCPB-aware hosts.
+
+```bash
+# Validate the manifest
+npm run validate:mcpb
+
+# Build a quick bundle (uses your current node_modules — may include devDeps)
+npm run pack:mcpb
+
+# Build a release bundle (production-only deps, ~2.5 MB)
+npm run release:mcpb
+```
+
+The release script reinstalls deps as production-only, builds, packs, then
+restores your dev environment. Output: `context-bridge-mcp.mcpb` at the repo root.
+
+**Note:** The MCPB `manifest.json` at the repo root is unrelated to the bridge's
+own `.context/manifest.json` per-repo registry — they describe different things
+in different scopes.
 
 ---
 

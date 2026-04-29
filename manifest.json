@@ -1,0 +1,58 @@
+{
+  "manifest_version": "0.3",
+  "name": "context-bridge-mcp",
+  "display_name": "Context Bridge",
+  "version": "1.0.0",
+  "description": "Project-agnostic shared context layer for AI agents working across multiple repos",
+  "long_description": "Context Bridge MCP gives AI agents a stateless I/O tool to read and write `.context/` folders across repos. Each repo declares its own domains via a manifest. The bridge resolves contracts across the ecosystem, tracks consumed contract versions automatically, and detects drift on the next session start. Companion skills (context-reader, context-feeder, context-bridge) install into any repo with `bridge_sync_skills`.",
+  "author": {
+    "name": "Bantarus"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Bantarus/context-bridge-mcp"
+  },
+  "license": "MIT",
+  "keywords": ["mcp", "context", "multi-repo", "ai-agents", "claude", "monorepo"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "ECOSYSTEM_ROOT": "${user_config.ecosystem_root}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "bridge_manifest", "description": "Return the full manifest — registry of all domains, components, and contracts in this repo." },
+    { "name": "bridge_get", "description": "Fetch a context file from the current repo's .context/ folder." },
+    { "name": "bridge_update", "description": "Write or overwrite a context file. Appends to the ecosystem changelog." },
+    { "name": "bridge_list", "description": "List all available context files. Optionally filter by domain." },
+    { "name": "bridge_get_from", "description": "Fetch a context file from another repo by ecosystem name or relative path." },
+    { "name": "bridge_get_contract", "description": "Fetch an API contract. Searches local then ecosystem repos. Pins consumed version for drift detection." },
+    { "name": "bridge_update_contract", "description": "Write or overwrite an API contract file. Appends to the ecosystem changelog." },
+    { "name": "bridge_list_contracts", "description": "List all existing contract files in this repo." },
+    { "name": "bridge_register", "description": "Register this repo in the shared ecosystem so other repos can discover it." },
+    { "name": "bridge_discover", "description": "List or inspect repos registered in the ecosystem." },
+    { "name": "bridge_changes", "description": "Show context/contract changes from other repos and detect contract version drift since last session." },
+    { "name": "bridge_manifest_update", "description": "Deep-merge a patch into the repo's manifest.json. Arrays are replaced wholesale." },
+    { "name": "bridge_sync_skills", "description": "Install or update the companion Claude Code skills (context-reader, context-feeder, context-bridge) into the current repo's .claude/skills/." }
+  ],
+  "user_config": {
+    "ecosystem_root": {
+      "type": "directory",
+      "title": "Ecosystem Root",
+      "description": "Where ecosystem.json and changelog.jsonl live. Multiple repos using the bridge share this location to discover each other and detect cross-repo contract drift.",
+      "default": "${HOME}/.context-bridge",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}

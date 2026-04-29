@@ -19,12 +19,16 @@ The project uses ESM (`"type": "module"`) with `tsconfig.json` targeting ES2022 
 
 ## Architecture
 
-The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 12 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories and a shared `ecosystem.json`.
+The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 13 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories, a shared `ecosystem.json`, and an append-only `changelog.jsonl`.
 
 **Key env vars:**
 - `CONTEXT_ROOT` — path to the `.context/` directory. Defaults to `$CWD/.context`.
 - `CONTRACTS_ROOT` — path to contracts. Defaults to `$CONTEXT_ROOT/contracts`. Can be overridden to point to a shared location.
 - `ECOSYSTEM_ROOT` — path to the shared ecosystem registry. Defaults to `~/.context-bridge`. Contains `ecosystem.json` which tracks all registered repos.
+
+**Boot behavior:** on startup the server creates `CONTEXT_ROOT` and `ECOSYSTEM_ROOT` if missing, and writes a default `manifest.json` (`{ "version": "1.0", "domains": {} }`) if one doesn't exist. This means a freshly-cloned repo gets a usable bridge state on the first MCP tool call without any setup.
+
+**Concurrency:** writes to `manifest.json` and `ecosystem.json` are atomic (write-then-rename via `writeFileAtomic`), so concurrent sessions never see a torn file. Lost updates from concurrent writes to the *same* file are still possible but rare in practice — most operations are per-repo and the changelog uses append-safe `appendFile`.
 
 ### `.context/` directory structure
 
@@ -44,7 +48,8 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 - `bridge_list` — discover existing context files with optional domain filter
 - `bridge_get_from` — read context files from another repo's `.context/` by path
 - `bridge_register` / `bridge_discover` — register repos in the ecosystem and discover them
-- `bridge_get_contract` / `bridge_update_contract` / `bridge_list_contracts` — read/write/list API contracts. `bridge_get_contract` searches local repo first, then all ecosystem repos that expose "contracts"
+- `bridge_get_contract` / `bridge_update_contract` / `bridge_list_contracts` — read/write/list API contracts. `bridge_get_contract` searches local repo first, then all ecosystem repos that expose "contracts". Automatically pins the consumed contract version in the ecosystem for drift detection
+- `bridge_changes` — show changes from other repos and detect contract version drift. Compares consumed versions (pinned by `bridge_get_contract`) against current versions. Also shows changelog entries filtered by `watches` in manifest. Mutation tools (`bridge_update`, `bridge_update_contract`, `bridge_manifest_update`) automatically append to `changelog.jsonl`
 - `bridge_sync_skills` — install/update companion skills (context-reader, context-feeder, context-bridge) into the current repo's `.claude/skills/`
 
 ### Security
@@ -61,8 +66,9 @@ When you modify the MCP server (tool signatures, tool names, path resolution, ma
 
 - `.claude/skills/context-reader/` — reads `.context/` at session start; must match current tool names and parameters
 - `.claude/skills/context-feeder/` — writes `.context/` after implementing; must match current tool names, parameters, and file format conventions
+- `.claude/skills/context-bridge/` — cross-repo coordination guide; must match tool names, ecosystem workflow, and onboarding steps
 
-If a tool is added, removed, or has its schema changed, both skills need to reflect that. Stale skills will generate incorrect tool calls and silently fail.
+If a tool is added, removed, or has its schema changed, all three skills need to reflect that. Stale skills will generate incorrect tool calls and silently fail.
 
 ## Companion files
 

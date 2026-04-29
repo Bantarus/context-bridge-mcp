@@ -29,9 +29,10 @@ ecosystem — no hardcoded paths needed.
 
 ### Rule 1 — Orient first
 
-Always call `bridge_manifest` and `bridge_discover` at the start of a session.
-Never assume what domains or repos exist. The manifest tells you what this repo
-owns. The ecosystem tells you what other repos exist and what they expose.
+Always call `bridge_manifest`, `bridge_discover`, and `bridge_changes` at the
+start of a session. Never assume what domains or repos exist. The manifest tells
+you what this repo owns. The ecosystem tells you what other repos exist and what
+they expose. Changes tells you what other repos modified since your last session.
 
 ### Rule 2 — Fetch with precision
 
@@ -54,6 +55,10 @@ in irrelevant context.
 
 `bridge_get_contract` searches the local repo first, then all ecosystem repos
 that expose `contracts`. No need to know which repo owns the contract.
+
+Every call to `bridge_get_contract` automatically pins the consumed version.
+When `bridge_changes` runs, it compares pinned versions against current versions
+and reports drift. This is why contracts **must** have a `## Version` section.
 
 ### Rule 4 — Write back after implementing
 
@@ -141,6 +146,11 @@ YYYY-MM-DD
 - YYYY-MM-DD: <what changed>
 ```
 
+The `## Version` section is required — the bridge extracts it to track which
+version each repo consumed. When a contract is updated, `bridge_changes`
+compares the pinned version against the current version and warns about drift.
+Always bump the version when changing a contract.
+
 ---
 
 ## Examples
@@ -156,19 +166,22 @@ Input: "Add a ready-up button that notifies the server when a player is ready"
 2. bridge_discover()
    → see what other repos exist (e.g. game-backend)
 
-3. bridge_get("<domain>", "<component>")
+3. bridge_changes()
+   → see if the other repo changed anything since last session
+
+4. bridge_get("<domain>", "<component>")
    → current state, events, API calls for your side
 
-4. bridge_get_contract("<domain>")
+5. bridge_get_contract("<domain>")
    → auto-resolved — the agreed API surface
 
-5. < implement the feature >
+6. < implement the feature >
 
-6. bridge_update("<domain>", "<component>", <updated content>)
+7. bridge_update("<domain>", "<component>", <updated content>)
    → bridge reflects the new state
 
-7. bridge_update_contract("<domain>", <add new endpoint>)
-   → the other repo's agent reads the updated contract
+8. bridge_update_contract("<domain>", <add new endpoint>)
+   → the other repo's agent sees the change via bridge_changes()
 ```
 
 Output: Contract updated with the new endpoint. Your repo's context file
@@ -240,6 +253,21 @@ bridge_manifest_update({
 ```
 
 Write context files for each component. At minimum, fill in Purpose and Exposes.
+
+Optionally declare `watches` so `bridge_changes` filters to relevant updates:
+
+```
+bridge_manifest_update({
+  patch: {
+    watches: {
+      "<other-repo>": ["contracts", "schemas"]
+    }
+  }
+})
+```
+
+If no `watches` are declared, `bridge_changes` shows all contract changes from
+other repos as a safe default.
 
 ### Step 3 — Register in the ecosystem
 

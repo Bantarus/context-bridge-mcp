@@ -52,7 +52,17 @@ After creating a new domain folder or component file, patch the manifest.
 The manifest is what `bridge_manifest()` returns — it's the table of contents.
 
 **Rule 5 — Contracts need explicit versioning.**
-Every change to a contract file must include a changelog entry with date.
+Every contract must have a `## Version` section with a version string.
+The bridge uses this to track which version each repo consumed and detect
+drift. Add a changelog entry with date on every change.
+
+**When to bump `## Version`:**
+Bump when the contract changes in a way that consumers must adapt to —
+new required fields, removed fields, changed types, renamed endpoints,
+changed event payloads, changed error semantics. Do NOT bump for
+clarification, prose edits, examples, formatting, or non-breaking additions
+like new optional fields. When in doubt, bump — false positives (extra
+drift warnings) are cheaper than false negatives (silent breakage).
 
 **Rule 6 — Register the repo in the ecosystem.**
 After scaffolding a new repo, call `bridge_register` so other repos can

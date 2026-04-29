@@ -7,8 +7,8 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { readFile, writeFile, readdir, mkdir, stat, cp } from "fs/promises";
-import { join, resolve, relative } from "path";
+import { readFile, writeFile, appendFile, readdir, mkdir, rename } from "fs/promises";
+import { join, resolve, relative, isAbsolute } from "path";
 import { existsSync } from "fs";
 import { homedir } from "os";
 
@@ -30,22 +30,41 @@ const ECOSYSTEM_ROOT = resolve(
 
 const ECOSYSTEM_PATH = join(ECOSYSTEM_ROOT, "ecosystem.json");
 
+const CHANGELOG_PATH = join(ECOSYSTEM_ROOT, "changelog.jsonl");
+
 // Skills shipped with this MCP server (relative to compiled dist/index.js)
 const SKILLS_SOURCE = resolve(import.meta.dirname, "..", ".claude", "skills");
 const BRIDGE_SKILLS = ["context-reader", "context-feeder", "context-bridge"];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface ConsumedVersion {
+  version: string;
+  source: string;       // which repo the contract was read from
+  consumedAt: string;   // ISO timestamp of when it was read
+}
+
 interface EcosystemEntry {
   path: string;
   exposes: string[];
   stack?: string;
   registeredAt: string;
+  lastCheckedAt?: string;
+  consumedVersions?: Record<string, ConsumedVersion>;  // keyed by contract domain
 }
 
 interface Ecosystem {
   version: string;
   repos: Record<string, EcosystemEntry>;
+}
+
+interface ChangelogEntry {
+  timestamp: string;
+  repo: string;
+  type: "context" | "contract" | "manifest";
+  domain: string;
+  component: string | null;
+  summary: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -61,16 +80,28 @@ async function readEcosystem(): Promise<Ecosystem> {
 
 async function writeEcosystem(data: Ecosystem): Promise<void> {
   await mkdir(ECOSYSTEM_ROOT, { recursive: true });
-  await writeFile(ECOSYSTEM_PATH, JSON.stringify(data, null, 2), "utf-8");
+  await writeFileAtomic(ECOSYSTEM_PATH, JSON.stringify(data, null, 2));
 }
 
 async function readManifest(): Promise<Record<string, unknown>> {
-  const raw = await readFile(MANIFEST_PATH, "utf-8").catch(() => "{}");
-  return JSON.parse(raw);
+  let raw: string;
+  try {
+    raw = await readFile(MANIFEST_PATH, "utf-8");
+  } catch {
+    return {};
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new McpError(
+      ErrorCode.InternalError,
+      "manifest.json is malformed — fix or delete the file to re-initialize"
+    );
+  }
 }
 
 async function writeManifest(data: Record<string, unknown>): Promise<void> {
-  await writeFile(MANIFEST_PATH, JSON.stringify(data, null, 2), "utf-8");
+  await writeFileAtomic(MANIFEST_PATH, JSON.stringify(data, null, 2));
 }
 
 function contextPath(
@@ -84,6 +115,14 @@ function contextPath(
 
 function contractPath(domain: string): string {
   return join(CONTRACTS_ROOT, `${domain}.md`);
+}
+
+async function writeFileAtomic(target: string, data: string): Promise<void> {
+  // Write to a sibling temp file then rename — rename is atomic so readers
+  // never see a torn file, and a crash mid-write leaves the original intact.
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, data, "utf-8");
+  await rename(tmp, target);
 }
 
 async function safeRead(path: string): Promise<string | null> {
@@ -120,6 +159,108 @@ function assertSafePath(resolvedPath: string, allowedRoots: string[]): void {
   if (!safe) {
     throw new McpError(ErrorCode.InvalidParams, "Path escapes allowed roots");
   }
+}
+
+// ─── Changelog helpers ────────────────────────────────────────────────────────
+
+function extractVersion(content: string): string | null {
+  const lines = content.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    // Match: ## Version, ## version, ## Version: 2.1, etc.
+    const inline = line.match(/^##\s+version\s*[:：]\s*(.+)$/i);
+    if (inline) {
+      return inline[1].trim().replace(/^[v]/i, "");
+    }
+    // Match: ## Version (value on a following line)
+    if (/^##\s+version\s*$/i.test(line)) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const val = lines[j].trim();
+        if (val.length === 0) continue;
+        if (val.startsWith("#")) break;  // hit next section without a value
+        return val.replace(/^[v]/i, "");
+      }
+    }
+  }
+  return null;
+}
+
+async function trackConsumedVersion(
+  domain: string,
+  content: string,
+  source: string
+): Promise<void> {
+  // Don't pin self-consumption — owning a contract isn't consuming it
+  if (source === "local") return;
+
+  const version = extractVersion(content);
+  if (!version) {
+    console.error(
+      `[context-bridge] contract "${domain}" from ${source} has no parseable ## Version section — skipping pin`
+    );
+    return;
+  }
+
+  const repoName = await currentRepoName();
+  const ecosystem = await readEcosystem();
+  const entry = ecosystem.repos[repoName];
+  if (!entry) return;  // repo not registered, can't track
+
+  if (!entry.consumedVersions) {
+    entry.consumedVersions = {};
+  }
+
+  // Only update consumedAt when the version (or source) actually changes —
+  // makes the field mean "since when has this consumption been at this version"
+  const existing = entry.consumedVersions[domain];
+  if (existing && existing.version === version && existing.source === source) {
+    return;  // no change, no write
+  }
+
+  entry.consumedVersions[domain] = {
+    version,
+    source,
+    consumedAt: new Date().toISOString(),
+  };
+  await writeEcosystem(ecosystem);
+}
+
+function extractSummary(content: string): string {
+  const line = content.split("\n").find((l) => l.trim().length > 0);
+  return (line ?? "").replace(/^#+\s*/, "").slice(0, 80);
+}
+
+async function currentRepoName(): Promise<string> {
+  const manifest = await readManifest();
+  if (typeof manifest.project === "string" && manifest.project) {
+    return manifest.project;
+  }
+  // Fallback: directory name of CWD
+  return process.cwd().split(/[\\/]/).pop() ?? "unknown";
+}
+
+async function appendChangelog(entry: ChangelogEntry): Promise<void> {
+  await mkdir(ECOSYSTEM_ROOT, { recursive: true });
+  await appendFile(CHANGELOG_PATH, JSON.stringify(entry) + "\n", "utf-8");
+}
+
+async function readChangelog(): Promise<ChangelogEntry[]> {
+  let raw: string;
+  try {
+    raw = await readFile(CHANGELOG_PATH, "utf-8");
+  } catch {
+    return [];
+  }
+  const entries: ChangelogEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line));
+    } catch {
+      // skip malformed lines
+    }
+  }
+  return entries;
 }
 
 // ─── Tool schemas ─────────────────────────────────────────────────────────────
@@ -167,6 +308,10 @@ const RegisterSchema = z.object({
 
 const DiscoverSchema = z.object({
   name: z.string().optional(),
+});
+
+const ChangesSchema = z.object({
+  since: z.string().optional(),
 });
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -264,7 +409,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "bridge_get_contract",
       description:
         "Fetch the API contract for a domain. Searches: 1) current repo's contracts, " +
-        "2) all ecosystem repos that expose 'contracts'. No need to know which repo owns it.",
+        "2) all ecosystem repos that expose 'contracts'. No need to know which repo owns it. " +
+        "Automatically pins the consumed version — bridge_changes will detect drift if the contract is updated later.",
       inputSchema: {
         type: "object",
         properties: {
@@ -326,14 +472,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "bridge_discover",
       description:
         "Discover repos registered in the ecosystem. Call with no args to list " +
-        "all repos and their exposed domains. Pass a name to get details for a " +
-        "specific repo including its resolved path and manifest.",
+        "all repos and their exposed domains. Pass a name to get details " +
+        "including its manifest. Use the repo name with bridge_get_from to read its files.",
       inputSchema: {
         type: "object",
         properties: {
           name: {
             type: "string",
             description: "Repo name to inspect. Omit to list all repos.",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "bridge_changes",
+      description:
+        "Show changes from other repos and detect contract version drift. " +
+        "Compares consumed contract versions (pinned by bridge_get_contract) against current versions. " +
+        "Also shows changelog entries filtered by 'watches' in manifest.json (or all contract changes if no watches). " +
+        "Call at session start after bridge_manifest and bridge_discover.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          since: {
+            type: "string",
+            description:
+              "ISO date to look back from (e.g. '2026-04-15'). " +
+              "Omit to use this repo's last-checked cursor from the ecosystem.",
           },
         },
         required: [],
@@ -350,7 +516,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "bridge_manifest_update",
       description:
-        "Deep-merge a patch object into manifest.json. Use after registering a new domain, component, or contract.",
+        "Deep-merge a patch object into manifest.json. Arrays are replaced wholesale, not appended — " +
+        "read the current manifest first if you need to add to an existing array. " +
+        "Use after registering a new domain, component, or contract.",
       inputSchema: {
         type: "object",
         properties: {
@@ -431,6 +599,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       assertSafePath(path, [CONTEXT_ROOT]);
       await mkdir(join(CONTEXT_ROOT, domain), { recursive: true });
       await writeFile(path, content, "utf-8");
+      await appendChangelog({
+        timestamp: new Date().toISOString(),
+        repo: await currentRepoName(),
+        type: "context",
+        domain,
+        component,
+        summary: extractSummary(content),
+      });
       return {
         content: [
           {
@@ -512,6 +688,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       assertSafePath(localPath, [CONTRACTS_ROOT]);
       const localContent = await safeRead(localPath);
       if (localContent) {
+        await trackConsumedVersion(domain, localContent, "local");
         return { content: [{ type: "text", text: localContent }] };
       }
 
@@ -527,12 +704,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         );
         const repoContent = await safeRead(repoContractPath);
         if (repoContent) {
+          await trackConsumedVersion(domain, repoContent, repoName);
           return {
             content: [
-              {
-                type: "text",
-                text: `[from ${repoName}]\n\n${repoContent}`,
-              },
+              { type: "text", text: `✓ Resolved from ecosystem repo: ${repoName}` },
+              { type: "text", text: repoContent },
             ],
           };
         }
@@ -556,6 +732,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "bridge_register": {
       const { name: repoName, path: repoPath, exposes, stack } =
         RegisterSchema.parse(args);
+      if (!isAbsolute(repoPath)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `path must be absolute (got: "${repoPath}"). Use an absolute path to the repo root.`
+        );
+      }
       const resolvedPath = resolve(repoPath);
       const ecosystem = await readEcosystem();
       ecosystem.repos[repoName] = {
@@ -644,6 +826,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       assertSafePath(path, [CONTRACTS_ROOT]);
       await mkdir(CONTRACTS_ROOT, { recursive: true });
       await writeFile(path, content, "utf-8");
+      await appendChangelog({
+        timestamp: new Date().toISOString(),
+        repo: await currentRepoName(),
+        type: "contract",
+        domain,
+        component: null,
+        summary: extractSummary(content),
+      });
       return {
         content: [
           { type: "text", text: `✓ Written: contracts/${domain}.md` },
@@ -673,6 +863,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const current = await readManifest();
       const merged = deepMerge(current, patch);
       await writeManifest(merged);
+      await appendChangelog({
+        timestamp: new Date().toISOString(),
+        repo: await currentRepoName(),
+        type: "manifest",
+        domain: "manifest",
+        component: null,
+        summary: "manifest updated",
+      });
       return {
         content: [
           {
@@ -683,10 +881,127 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    // ── bridge_changes ──────────────────────────────────────────────────
+    case "bridge_changes": {
+      const { since } = ChangesSchema.parse(args ?? {});
+      const repoName = await currentRepoName();
+      const manifest = await readManifest();
+      const watches = manifest.watches as Record<string, string[]> | undefined;
+      const ecosystem = await readEcosystem();
+      const myEntry = ecosystem.repos[repoName];
+
+      // Determine cursor: explicit `since`, or this repo's lastCheckedAt, or epoch
+      let cursor: string;
+      if (since) {
+        cursor = since;
+      } else if (myEntry?.lastCheckedAt) {
+        cursor = myEntry.lastCheckedAt;
+      } else {
+        cursor = "1970-01-01T00:00:00Z";
+      }
+
+      // ── Part 1: changelog entries since cursor ──
+      const allEntries = await readChangelog();
+      const relevant = allEntries.filter((e) => {
+        if (e.repo === repoName) return false;
+        if (e.timestamp <= cursor) return false;
+        if (watches) {
+          const watchedDomains = watches[e.repo];
+          if (!watchedDomains) return false;
+          return watchedDomains.includes(e.domain) || watchedDomains.includes(e.type);
+        }
+        return e.type === "contract";
+      });
+
+      const changeLines = relevant.map((e) => {
+        const date = e.timestamp.slice(0, 10);
+        const target = e.component
+          ? `${e.domain}/${e.component}`
+          : e.domain;
+        let line = `  [${date}] ${e.repo} updated ${e.type} "${target}"`;
+        if (e.summary) line += `\n    → ${e.summary}`;
+        return line;
+      });
+
+      // ── Part 2: version drift detection ──
+      const driftLines: string[] = [];
+      const consumed = myEntry?.consumedVersions ?? {};
+
+      for (const [contractDomain, pin] of Object.entries(consumed)) {
+        // Source repo no longer in ecosystem — surface as orphan dependency
+        if (!ecosystem.repos[pin.source]) {
+          driftLines.push(
+            `  ⚠ contract "${contractDomain}": pinned to v${pin.version} from "${pin.source}", but "${pin.source}" is no longer registered in the ecosystem`
+          );
+          continue;
+        }
+
+        const sourcePath = join(
+          resolve(ecosystem.repos[pin.source].path),
+          ".context",
+          "contracts",
+          `${contractDomain}.md`
+        );
+        const currentContent = await safeRead(sourcePath);
+
+        if (!currentContent) {
+          driftLines.push(
+            `  ⚠ contract "${contractDomain}": pinned to v${pin.version} from "${pin.source}", but the contract file no longer exists in that repo`
+          );
+          continue;
+        }
+
+        const currentVersion = extractVersion(currentContent);
+        if (!currentVersion) continue;
+        if (currentVersion !== pin.version) {
+          driftLines.push(
+            `  ⚠ contract "${contractDomain}": you consumed v${pin.version} from ${pin.source} on ${pin.consumedAt.slice(0, 10)}, current is v${currentVersion}`
+          );
+        }
+      }
+
+      // ── Update lastCheckedAt cursor ──
+      if (myEntry) {
+        myEntry.lastCheckedAt = new Date().toISOString();
+        await writeEcosystem(ecosystem);
+      }
+
+      // ── Build response ──
+      const sections: string[] = [];
+
+      if (driftLines.length > 0) {
+        sections.push(
+          `Version drift detected (${driftLines.length}):\n\n${driftLines.join("\n\n")}`
+        );
+      }
+
+      if (changeLines.length > 0) {
+        sections.push(
+          `${changeLines.length} change(s) since ${cursor.slice(0, 10)}:\n\n${changeLines.join("\n\n")}`
+        );
+      }
+
+      if (sections.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No changes or version drift since ${cursor.slice(0, 10)}.`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          { type: "text", text: sections.join("\n\n---\n\n") },
+        ],
+      };
+    }
+
     // ── bridge_sync_skills ────────────────────────────────────────────────
     case "bridge_sync_skills": {
       const targetRoot = join(process.cwd(), ".claude", "skills");
-      const results: string[] = [];
 
       if (!existsSync(SKILLS_SOURCE)) {
         throw new McpError(
@@ -695,24 +1010,74 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         );
       }
 
+      // Walk a skill directory and return relative paths of all files
+      async function walkFiles(root: string): Promise<string[]> {
+        const out: string[] = [];
+        async function walk(dir: string, prefix: string): Promise<void> {
+          let entries;
+          try {
+            entries = await readdir(dir, { withFileTypes: true });
+          } catch {
+            return;
+          }
+          for (const e of entries) {
+            const sub = prefix ? `${prefix}/${e.name}` : e.name;
+            if (e.isDirectory()) {
+              await walk(join(dir, e.name), sub);
+            } else if (e.isFile()) {
+              out.push(sub);
+            }
+          }
+        }
+        await walk(root, "");
+        return out;
+      }
+
+      const added: string[] = [];
+      const updated: string[] = [];
+      const unchanged: string[] = [];
+
       for (const skill of BRIDGE_SKILLS) {
         const src = join(SKILLS_SOURCE, skill);
         if (!existsSync(src)) continue;
         const dest = join(targetRoot, skill);
-        await cp(src, dest, { recursive: true, force: true });
-        results.push(skill);
+
+        const files = await walkFiles(src);
+        for (const rel of files) {
+          const srcFile = join(src, rel);
+          const destFile = join(dest, rel);
+          const newContent = await readFile(srcFile, "utf-8");
+          const oldContent = await safeRead(destFile);
+          const label = `${skill}/${rel}`;
+
+          if (oldContent === null) {
+            await mkdir(join(destFile, ".."), { recursive: true });
+            await writeFile(destFile, newContent, "utf-8");
+            added.push(label);
+          } else if (oldContent !== newContent) {
+            await writeFile(destFile, newContent, "utf-8");
+            updated.push(label);
+          } else {
+            unchanged.push(label);
+          }
+        }
+      }
+
+      const lines: string[] = [];
+      if (added.length > 0) {
+        lines.push(`Added (${added.length}):\n${added.map((f) => `  + ${f}`).join("\n")}`);
+      }
+      if (updated.length > 0) {
+        lines.push(`Updated (${updated.length}):\n${updated.map((f) => `  ~ ${f}`).join("\n")}`);
+      }
+      if (added.length === 0 && updated.length === 0) {
+        lines.push(`✓ All ${unchanged.length} skill files already up to date.`);
+      } else {
+        lines.push(`✓ Synced to .claude/skills/ (${unchanged.length} unchanged).`);
       }
 
       return {
-        content: [
-          {
-            type: "text",
-            text:
-              results.length > 0
-                ? `✓ Synced ${results.length} skills to .claude/skills/:\n${results.map((s) => `  - ${s}`).join("\n")}`
-                : "No skills found to sync.",
-          },
-        ],
+        content: [{ type: "text", text: lines.join("\n\n") }],
       };
     }
 
