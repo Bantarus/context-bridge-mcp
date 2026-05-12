@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Default coverage on Ubuntu across supported Node versions, plus a
+        # single sanity run on macOS and Windows.
+        include:
+          - os: ubuntu-latest
+            node: 20.x
+          - os: ubuntu-latest
+            node: 22.x
+          - os: ubuntu-latest
+            node: 24.x
+          - os: macos-latest
+            node: 22.x
+          - os: windows-latest
+            node: 22.x
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Validate MCPB manifest
+        run: npm run validate:mcpb
+
+      - name: Test
+        # Unit + integration + scenarios. Headless e2e tests are
+        # local-only (require a Claude Code subscription); they self-skip
+        # when RUN_E2E_HEADLESS is unset, which is the default in CI.
+        run: npm test
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests with coverage
+        # Coverage only sees code that runs in the test process — the
+        # integration layer spawns the compiled bridge as a subprocess so
+        # those branches don't show up here. The number reflects the unit
+        # layer; behaviour is still verified by the full suite above.
+        run: npm run test:coverage
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14

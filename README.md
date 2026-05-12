@@ -12,9 +12,12 @@ Three install paths depending on your use case:
 
 ### A. `.mcpb` bundle (one-click install in Claude Desktop and other MCPB-aware hosts)
 
-Build the bundle from source:
+Download the latest `.mcpb` from the
+[GitHub Releases page](https://github.com/Bantarus/context-bridge-mcp/releases/latest),
+or build one from source:
 
 ```bash
+npm install
 npm run release:mcpb
 # Produces: context-bridge-mcp.mcpb
 ```
@@ -50,9 +53,16 @@ Or use `claude.json.example` as a template for per-repo configuration.
 
 ### C. Embed in a host application (Electron operator gateway, IDE plugin, etc.)
 
+Context Bridge is **not** published to npm — install it directly from this
+GitHub repo:
+
 ```bash
-npm install context-bridge-mcp
+npm install github:Bantarus/context-bridge-mcp
+# Or pin to a specific release tag:
+npm install github:Bantarus/context-bridge-mcp#v1.0.0
 ```
+
+npm runs the `prepare` script after install, which builds `dist/` for you.
 
 See [Embedding in a host application](#embedding-in-a-host-application) below for
 the spawn pattern.
@@ -254,6 +264,19 @@ watches, you only see changes from the repos and domains you care about:
   }
 }
 ```
+
+Each watch token matches in two ways:
+
+- **Category keyword** — `"contracts"` matches all contract changes,
+  `"context"` matches all context changes, `"manifests"` matches manifest
+  changes. Both singular (`"contract"`) and plural (`"contracts"`) forms
+  work, case-insensitive.
+- **Specific domain name** — `"schemas"` matches changes whose domain is
+  `schemas` (typically context files under `.context/schemas/`); `"users"`
+  matches the `users` contract or any domain literally named `users`.
+
+The example above subscribes to *all* of `my-api`'s contracts plus changes
+in its `schemas` domain, and to anything in `shared-lib`'s `events` domain.
 
 If no watches are declared, `bridge_changes` shows all contract changes from
 other repos as a safe default.
@@ -616,6 +639,35 @@ above.
 - **Cross-environment paths.** WSL/Windows path translation still applies
   (see the WSL section above); bind mounts in WSL pointing at `/mnt/c/...`
   carry the same performance cost as the non-Docker path.
+
+---
+
+## Testing
+
+The suite is split into four layers, in increasing fidelity:
+
+| Layer | Path | Speed | Runs in CI? |
+|---|---|---|---|
+| **Unit** | [test/unit/](test/unit/) | <100ms | ✅ |
+| **Integration** | [test/integration/](test/integration/) | ~400ms (spawns the compiled bridge per file, drives it via real MCP Client over stdio) | ✅ |
+| **Scenarios** | [test/scenarios/](test/scenarios/) | ~300ms (multi-repo journeys: greenfield onboarding, contract drift + recovery, watches filter, resolution precedence) | ✅ |
+| **Headless E2E** | [test/e2e-headless/](test/e2e-headless/) | ~10s each (spawns real `claude -p` and asserts the bridge was driven correctly) | ❌ local-only |
+
+```bash
+npm test                    # unit + integration + scenarios (everything CI runs)
+npm run test:watch          # vitest watch mode
+npm run test:coverage       # with v8 coverage report
+RUN_E2E_HEADLESS=1 npm run test:e2e   # local-only — see below
+```
+
+### Why headless E2E tests don't run in CI
+
+The headless tests spawn `claude -p` and drive the bridge as a real agent would. They need a Claude account (subscription OAuth via `~/.claude/.credentials.json`, or a long-lived token from `claude setup-token` exported as `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`). The default CI workflows in this repo deliberately do **not** wire up any of those — running the suite on every PR would cost real money and the value-vs-cost tradeoff isn't compelling for a small project. Developers should run them locally before tagging releases.
+
+If you want to enable them in CI:
+1. `claude setup-token` locally — get a long-lived OAuth token tied to your subscription.
+2. Add it as a GitHub Actions secret named `CLAUDE_CODE_OAUTH_TOKEN`.
+3. Add a `RUN_E2E_HEADLESS: "1"` env and `CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}` to a CI step that runs `npm run test:e2e`.
 
 ---
 

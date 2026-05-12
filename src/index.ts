@@ -9,8 +9,10 @@ import {
 import { z } from "zod";
 import { readFile, writeFile, appendFile, readdir, mkdir, rename } from "fs/promises";
 import { join, resolve, relative, isAbsolute } from "path";
-import { existsSync } from "fs";
+import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
+import { fileURLToPath } from "url";
+import { randomBytes } from "crypto";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -117,10 +119,13 @@ function contractPath(domain: string): string {
   return join(CONTRACTS_ROOT, `${domain}.md`);
 }
 
-async function writeFileAtomic(target: string, data: string): Promise<void> {
+export async function writeFileAtomic(target: string, data: string): Promise<void> {
   // Write to a sibling temp file then rename — rename is atomic so readers
   // never see a torn file, and a crash mid-write leaves the original intact.
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  // The 4-byte random suffix prevents collisions when multiple atomic writes
+  // to the same target happen within a single millisecond from the same pid
+  // (e.g. Promise.all([writeFileAtomic(p, a), writeFileAtomic(p, b)])).
+  const tmp = `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
   await writeFile(tmp, data, "utf-8");
   await rename(tmp, target);
 }
@@ -151,7 +156,17 @@ async function listMdFiles(dir: string): Promise<string[]> {
   }
 }
 
-function assertSafePath(resolvedPath: string, allowedRoots: string[]): void {
+/**
+ * Throw if `resolvedPath` is not inside any of `allowedRoots`.
+ *
+ * WARNING: this is a string-based check via `path.relative` — it does NOT
+ * follow symlinks. If a symlink inside an allowed root points outside,
+ * filesystem access via the resolved path will escape even though this
+ * function passes. The bridge mitigates by owning its own roots and never
+ * creating symlinks; consumers of this function as a library MUST realpath
+ * their inputs first if untrusted symlinks may exist.
+ */
+export function assertSafePath(resolvedPath: string, allowedRoots: string[]): void {
   const safe = allowedRoots.some((root) => {
     const rel = relative(root, resolvedPath);
     return !rel.startsWith("..");
@@ -163,7 +178,7 @@ function assertSafePath(resolvedPath: string, allowedRoots: string[]): void {
 
 // ─── Changelog helpers ────────────────────────────────────────────────────────
 
-function extractVersion(content: string): string | null {
+export function extractVersion(content: string): string | null {
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
@@ -225,7 +240,7 @@ async function trackConsumedVersion(
   await writeEcosystem(ecosystem);
 }
 
-function extractSummary(content: string): string {
+export function extractSummary(content: string): string {
   const line = content.split("\n").find((l) => l.trim().length > 0);
   return (line ?? "").replace(/^#+\s*/, "").slice(0, 80);
 }
@@ -242,6 +257,35 @@ async function currentRepoName(): Promise<string> {
 async function appendChangelog(entry: ChangelogEntry): Promise<void> {
   await mkdir(ECOSYSTEM_ROOT, { recursive: true });
   await appendFile(CHANGELOG_PATH, JSON.stringify(entry) + "\n", "utf-8");
+}
+
+/**
+ * Watch tokens map to either a specific domain name (e.g. "users" → entries
+ * whose `domain === "users"`), or a category keyword that maps to one of the
+ * stored type values. Categories accept both the singular type name and the
+ * conventional plural the README example uses ("contracts" → type "contract").
+ * Match is case-insensitive on the category keyword; domain match is strict.
+ */
+const WATCH_CATEGORY_ALIASES: Record<string, ChangelogEntry["type"]> = {
+  contract: "contract",
+  contracts: "contract",
+  context: "context",
+  manifest: "manifest",
+  manifests: "manifest",
+};
+
+export function watchMatchesEntry(
+  watchList: string[],
+  entry: ChangelogEntry
+): boolean {
+  for (const w of watchList) {
+    // Exact domain match — e.g. "users" matches a contract or context with domain "users"
+    if (w === entry.domain) return true;
+    // Category match — both singular ("contract") and plural ("contracts") supported
+    const alias = WATCH_CATEGORY_ALIASES[w.toLowerCase()];
+    if (alias && alias === entry.type) return true;
+  }
+  return false;
 }
 
 async function readChangelog(): Promise<ChangelogEntry[]> {
@@ -906,10 +950,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (e.repo === repoName) return false;
         if (e.timestamp <= cursor) return false;
         if (watches) {
-          const watchedDomains = watches[e.repo];
-          if (!watchedDomains) return false;
-          return watchedDomains.includes(e.domain) || watchedDomains.includes(e.type);
+          const watchList = watches[e.repo];
+          if (!watchList) return false;
+          return watchMatchesEntry(watchList, e);
         }
+        // No watches declared — default to surfacing all contract changes
+        // (the most common "I depend on this" signal) from other repos.
         return e.type === "contract";
       });
 
@@ -1088,7 +1134,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // ─── Deep merge util ──────────────────────────────────────────────────────────
 
-function deepMerge(
+export function deepMerge(
   target: Record<string, unknown>,
   source: Record<string, unknown>
 ): Record<string, unknown> {
@@ -1134,7 +1180,21 @@ async function main() {
   console.error("[context-bridge] Context Bridge MCP running on stdio");
 }
 
-main().catch((err) => {
-  console.error("[context-bridge] Fatal:", err);
-  process.exit(1);
-});
+function isInvokedDirectly(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      realpathSync(fileURLToPath(import.meta.url)) ===
+      realpathSync(process.argv[1])
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isInvokedDirectly()) {
+  main().catch((err) => {
+    console.error("[context-bridge] Fatal:", err);
+    process.exit(1);
+  });
+}

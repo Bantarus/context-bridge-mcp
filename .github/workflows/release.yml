@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# A failed release should never be retried automatically — leave it to a
+# human to inspect, fix forward, and tag again.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  release:
+    name: Build and attach .mcpb to GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for release notes
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (unit + integration + scenarios)
+        # Headless e2e tests are local-only; CI gate is RUN_E2E_HEADLESS=1
+        # which we deliberately leave unset.
+        run: npm test
+
+      - name: Build the bridge
+        run: npm run build
+
+      - name: Validate MCPB manifest
+        run: npm run validate:mcpb
+
+      - name: Pack .mcpb bundle
+        # release:mcpb does: build (already done) → prod-only deps → pack
+        # → restore dev deps. Re-running it here is the safest path.
+        run: npm run release:mcpb
+
+      - name: Create GitHub Release with .mcpb attached
+        # Pinned to v2.6.2 SHA — verify and bump periodically against
+        # https://github.com/softprops/action-gh-release/releases
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          files: ./*.mcpb
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

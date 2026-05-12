@@ -18,9 +18,14 @@
     "build": "tsc && node scripts/add-shebang.js",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "prepublishOnly": "npm run build",
-    "pack:mcpb": "npx -y -p @anthropic-ai/mcpb@latest mcpb pack",
-    "validate:mcpb": "npx -y -p @anthropic-ai/mcpb@latest mcpb validate manifest.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "vitest run test/e2e-headless",
+    "prepare": "npm run build",
+    "pack:mcpb": "npx -y -p @anthropic-ai/mcpb@2.1.2 mcpb pack",
+    "validate:mcpb": "npx -y -p @anthropic-ai/mcpb@2.1.2 mcpb validate manifest.json",
     "release:mcpb": "npm ci && npm run build && rm -rf node_modules && npm ci --omit=dev && npm run pack:mcpb && npm install"
   },
   "dependencies": {
@@ -29,7 +34,12 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.6",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.6"
+  },
+  "engines": {
+    "node": ">=20.11.0"
   }
 }
