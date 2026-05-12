@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+#
+# Reference Dockerfile for context-bridge-mcp.
+#
+# This file is an EXAMPLE — copy it into your org's infra repo (or to the
+# repo root as `Dockerfile`) and adapt:
+#   - Pin the base image to a digest for reproducibility
+#   - Add your org's CA certificates, proxy config, vuln-scan labels
+#   - Tag the final image with your private OCI registry
+#
+# See the README section "Optional: Docker deployment (for organizations)"
+# for the runtime invocation and bind-mount requirements.
+
+# ─── Build stage ────────────────────────────────────────────────────────────
+FROM node:22-alpine AS build
+WORKDIR /app
+
+# Full deps (TypeScript + types) so tsc and the shebang script can run
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Sources + build pipeline
+COPY tsconfig.json ./
+COPY src ./src
+COPY scripts ./scripts
+RUN npm run build
+# -> dist/index.js with shebang + executable bit
+
+# ─── Runtime stage ──────────────────────────────────────────────────────────
+FROM node:22-alpine AS runtime
+WORKDIR /app
+
+# Production deps only
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# Compiled server
+COPY --from=build /app/dist ./dist
+
+# Companion skills — bridge_sync_skills resolves them via import.meta.dirname,
+# so they must live alongside dist/ inside the image
+COPY .claude/skills/context-reader ./.claude/skills/context-reader
+COPY .claude/skills/context-feeder ./.claude/skills/context-feeder
+COPY .claude/skills/context-bridge ./.claude/skills/context-bridge
+
+# Defaults — the caller MUST bind-mount these paths at runtime (see README)
+ENV ECOSYSTEM_ROOT=/ecosystem
+
+# Note on user: this image runs as root by default to match the bind-mount
+# semantics of other Docker MCP catalog servers (e.g. mcp/filesystem). To
+# harden, switch to the unprivileged `node` user and ensure your bind-mount
+# host paths are owned by uid 1000:
+#   USER node
+
+# stdio MCP — no port, no HTTP endpoint
+ENTRYPOINT ["node", "/app/dist/index.js"]

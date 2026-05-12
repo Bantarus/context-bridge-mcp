@@ -10,6 +10,7 @@ scripts/
 # Project state (not needed at runtime)
 .context/
 docs/
+docker/
 
 # Build artifacts
 *.mcpb

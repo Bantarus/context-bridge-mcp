@@ -527,6 +527,98 @@ in different scopes.
 
 ---
 
+## Optional: Docker deployment (for organizations)
+
+Individual developers should use the `.mcpb` bundle above. The Docker path is
+for **organizations** that have standardized on Docker MCP Gateway, want to
+distribute through a private OCI registry, or need supply-chain governance
+(signing, SBOMs, central allowlists). The repo includes three reference files
+under [docker/](docker/) as starting points for your platform team to adapt —
+context-bridge does **not** publish or maintain its own Docker images.
+
+### Reference files
+
+| File | Purpose |
+|------|---------|
+| [docker/Dockerfile.example](docker/Dockerfile.example) | Multi-stage build, ~80 MB alpine image, dist/ + companion skills |
+| [docker/catalog-entry.example.yaml](docker/catalog-entry.example.yaml) | Minimal `server.yaml` for `docker mcp catalog server add` or `profile server add` |
+| [docker/.dockerignore.example](docker/.dockerignore.example) | Copy to repo root before building to shrink build context |
+
+### Build and tag
+
+```bash
+cp docker/.dockerignore.example .dockerignore
+docker build -f docker/Dockerfile.example \
+  -t registry.internal.corp/mcp/context-bridge:1.0.0 .
+docker push registry.internal.corp/mcp/context-bridge:1.0.0
+```
+
+### Run directly via `docker run` (portable, no gateway required)
+
+Context Bridge is a **filesystem orchestrator**: it must see the active repo
+and the shared ecosystem directory. The MCP client speaks stdio over
+`docker run -i`:
+
+```bash
+docker run -i --rm \
+  -v "$PWD:/workspace" \
+  -v "$HOME/.context-bridge:/ecosystem" \
+  -e ECOSYSTEM_ROOT=/ecosystem \
+  -w /workspace \
+  registry.internal.corp/mcp/context-bridge:1.0.0
+```
+
+| Flag | Why |
+|------|-----|
+| `-i` | stdio transport — keep stdin open |
+| `-v "$PWD:/workspace"` | the bridge reads `.context/` from the **active repo** |
+| `-v "$HOME/.context-bridge:/ecosystem"` | shared ecosystem registry must persist across runs |
+| `-e ECOSYSTEM_ROOT=/ecosystem` | tells the bridge where the ecosystem lives inside the container |
+| `-w /workspace` | sets `process.cwd()` so the default `CONTEXT_ROOT` resolves correctly |
+
+**Caveat:** when registering with `claude mcp add`, the bind-mount path is
+fixed at registration time. If you `cd` into a different repo, the container
+will still see whichever directory you registered. Solutions:
+
+- Use the **MCPB bundle** instead (recommended for the common per-repo workflow)
+- Register the server **per-repo** with a wrapper script that resolves `$PWD`
+- Use **Docker MCP Gateway** (next section) which manages per-session mounts
+
+### Run via Docker MCP Gateway (centralized governance)
+
+Add the server to a private custom catalog and distribute it to your team:
+
+```bash
+# Platform team — build the catalog once
+docker mcp catalog create registry.internal.corp/mcp/team-catalog:latest \
+  --title "Internal MCP Tools" \
+  --server file://./docker/catalog-entry.example.yaml \
+  --server docker://registry.internal.corp/mcp/internal-api:latest
+
+docker mcp catalog push registry.internal.corp/mcp/team-catalog:latest
+
+# Individual developers
+docker mcp catalog pull registry.internal.corp/mcp/team-catalog:latest
+docker mcp gateway run --catalog registry.internal.corp/mcp/team-catalog:latest
+```
+
+The `volumes` / `env` / `workingDir` schema at the per-server level varies
+across Docker Desktop versions — the [catalog-entry.example.yaml](docker/catalog-entry.example.yaml)
+ships with commented hints. Validate against your toolkit's current reference
+before rolling out; if in doubt, fall back to the raw `docker run` invocation
+above.
+
+### What this does not solve
+
+- **Active-repo discovery.** A container has no view of the user's full
+  filesystem. The MCPB path remains the right answer for the everyday
+  "I just `cd`'d into a different repo" workflow.
+- **Cross-environment paths.** WSL/Windows path translation still applies
+  (see the WSL section above); bind mounts in WSL pointing at `/mnt/c/...`
+  carry the same performance cost as the non-Docker path.
+
+---
+
 ## Dev workflow
 
 ```bash

@@ -1,0 +1,45 @@
+# Reference .dockerignore for context-bridge-mcp.
+# Copy to the repo root (`.dockerignore`) before running `docker build` —
+# it shrinks the build context and prevents accidentally COPYing local state
+# (your own .context/, the .mcpb artifact, repo-specific docs) into the image.
+
+# Build artifacts
+dist/
+*.mcpb
+*.log
+
+# Node + tooling
+node_modules/
+.npmrc
+coverage/
+
+# Repo metadata
+.git/
+.github/
+.gitignore
+
+# Per-repo state (we don't want a developer's local .context/ baked into a shared image)
+.context/
+docs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Test artifacts
+test-output/
+
+# Skill source — the build stage selectively COPYs only the three bridge
+# companion skills it actually ships, so the rest is build-context bloat.
+.claude/skills/skill-creator/
+.claude/skills/apm-*/
+.claude/skills/docker-mcp-*/
+.claude/skills/mcp-builder/
+.claude/skills/conversation-compiler/
+.claude/skills/recall/
+.claude/skills/searchchat/
+.claude/skills/readchat/
+
+# The docker/ examples themselves don't need to be inside the image
+docker/

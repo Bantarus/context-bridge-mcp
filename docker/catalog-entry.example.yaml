@@ -1,0 +1,45 @@
+# Reference custom-catalog entry for context-bridge-mcp.
+#
+# Add this server to a custom Docker MCP catalog or directly to a profile:
+#
+#   # Build/extend a private catalog
+#   docker mcp catalog create registry.example.com/mcp/team-catalog:latest \
+#     --title "Internal MCP Tools" \
+#     --server file://./docker/catalog-entry.example.yaml
+#
+#   docker mcp catalog push registry.example.com/mcp/team-catalog:latest
+#
+#   # Or add directly to a profile
+#   docker mcp profile server add <profile-id> \
+#     --server file://./docker/catalog-entry.example.yaml
+#
+# Schema reference:
+#   https://docs.docker.com/ai/mcp-catalog-and-toolkit/
+#   https://github.com/docker/mcp-registry
+
+name: context-bridge
+title: Context Bridge
+type: server
+image: registry.example.com/mcp/context-bridge:1.0.0   # ← replace with your org's registry tag
+description: |
+  Project-agnostic shared context layer for AI agents working across multiple
+  repos. Reads .context/ folders from the active repo and tracks cross-repo
+  contract drift via a shared ecosystem registry.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTANT: context-bridge is a filesystem-orchestrator MCP and REQUIRES
+# bind mounts of (a) the active repo and (b) the shared ecosystem directory.
+#
+# The exact YAML keys for `volumes`, `env`, and `workingDir` at the
+# per-server level vary by Docker Desktop / MCP Toolkit version. The block
+# below is a HINT — uncomment and adapt to your toolkit's current schema.
+# Until you've validated the gateway honors them, fall back to the raw
+# `docker run` invocation documented in the README.
+#
+# volumes:
+#   - "{{HOST_PWD}}:/workspace"             # active repo → /workspace
+#   - "{{HOME}}/.context-bridge:/ecosystem" # shared ecosystem registry
+# workingDir: /workspace
+# env:
+#   - ECOSYSTEM_ROOT=/ecosystem
+# ─────────────────────────────────────────────────────────────────────────────
