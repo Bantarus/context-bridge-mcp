@@ -36,7 +36,7 @@
     "prepare": "npm run build",
     "pack:mcpb": "npx -y -p @anthropic-ai/mcpb@2.1.2 mcpb pack",
     "validate:mcpb": "npx -y -p @anthropic-ai/mcpb@2.1.2 mcpb validate manifest.json",
-    "release:mcpb": "npm ci && npm run build && rm -rf node_modules && npm ci --omit=dev && npm run pack:mcpb && npm install"
+    "release:mcpb": "npm ci && npm prune --omit=dev && npm run pack:mcpb && npm install"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
