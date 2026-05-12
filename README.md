@@ -1,5 +1,10 @@
 # Context Bridge MCP
 
+[![CI](https://github.com/Bantarus/context-bridge-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Bantarus/context-bridge-mcp/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/Bantarus/context-bridge-mcp?display_name=tag&sort=semver)](https://github.com/Bantarus/context-bridge-mcp/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20.11-blue.svg)](https://nodejs.org/)
+
 A lightweight, project-agnostic MCP server that gives Claude Code agents shared
 context across multiple repos on the same machine. Each repo owns its own
 `.context/` folder — the server is a stateless I/O tool with zero project knowledge.

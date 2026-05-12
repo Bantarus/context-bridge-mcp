@@ -2,6 +2,16 @@
   "name": "context-bridge-mcp",
   "version": "1.0.0",
   "description": "Context Bridge MCP — project-agnostic shared context layer for multi-repo projects",
+  "license": "MIT",
+  "author": "Bantarus",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bantarus/context-bridge-mcp.git"
+  },
+  "homepage": "https://github.com/Bantarus/context-bridge-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Bantarus/context-bridge-mcp/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "bin": {
