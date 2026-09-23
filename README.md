@@ -50,11 +50,25 @@ Optional: override the contracts directory for a shared location:
 
 ```bash
 claude mcp add --scope user --transport stdio context-bridge \
-  -- node /absolute/path/to/context-bridge-mcp/dist/index.js \
-  --env CONTRACTS_ROOT=/absolute/path/to/shared-contracts
+  --env CONTRACTS_ROOT=/absolute/path/to/shared-contracts \
+  -- node /absolute/path/to/context-bridge-mcp/dist/index.js
 ```
 
+(`--env` must come before `--`; anything after it is passed to `node`.)
+
 Or use `claude.json.example` as a template for per-repo configuration.
+
+**Additional WSL distros** don't need their own clone. Once the distro that
+holds the build is bind-mounted under `/mnt/wsl/<Distro>` (see
+[WSL + Windows cross-environment usage](#wsl--windows-cross-environment-usage)),
+register that same build from the other distro:
+
+```bash
+# Inside e.g. Ubuntu-24.04, as the user who runs Claude Code
+claude mcp add --scope user --transport stdio context-bridge \
+  --env ECOSYSTEM_ROOT=/mnt/c/Users/you/.context-bridge \
+  -- node /mnt/wsl/Ubuntu/home/you/DEV/context-bridge-mcp/dist/index.js
+```
 
 ### C. Embed in a host application (Electron operator gateway, IDE plugin, etc.)
 
