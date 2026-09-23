@@ -7,8 +7,8 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { readFile, writeFile, appendFile, readdir, mkdir, rename } from "fs/promises";
-import { join, resolve, relative, isAbsolute } from "path";
+import { readFile, writeFile, appendFile, readdir, mkdir, rename, open, stat, rm } from "fs/promises";
+import { join, resolve, relative, isAbsolute, sep, posix, win32 } from "path";
 import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
@@ -34,6 +34,8 @@ const ECOSYSTEM_PATH = join(ECOSYSTEM_ROOT, "ecosystem.json");
 
 const CHANGELOG_PATH = join(ECOSYSTEM_ROOT, "changelog.jsonl");
 
+const ECOSYSTEM_LOCK_PATH = join(ECOSYSTEM_ROOT, "ecosystem.lock");
+
 // Skills shipped with this MCP server (relative to compiled dist/index.js)
 const SKILLS_SOURCE = resolve(import.meta.dirname, "..", ".claude", "skills");
 const BRIDGE_SKILLS = ["context-reader", "context-feeder", "context-bridge"];
@@ -47,11 +49,13 @@ interface ConsumedVersion {
 }
 
 interface EcosystemEntry {
-  path: string;
+  path: string;            // canonical form — see toCanonicalPath()
+  contractsPath?: string;  // canonical; only set when contracts live outside <path>/.context/contracts
   exposes: string[];
   stack?: string;
   registeredAt: string;
   lastCheckedAt?: string;
+  changelogCursor?: number;  // number of complete changelog.jsonl lines already seen
   consumedVersions?: Record<string, ConsumedVersion>;  // keyed by contract domain
 }
 
@@ -71,18 +75,99 @@ interface ChangelogEntry {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+function errorCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException | null)?.code;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function readEcosystem(): Promise<Ecosystem> {
+  let raw: string;
   try {
-    const raw = await readFile(ECOSYSTEM_PATH, "utf-8");
-    return JSON.parse(raw);
+    raw = await readFile(ECOSYSTEM_PATH, "utf-8");
   } catch {
     return { version: "1.0", repos: {} };
+  }
+  // A malformed file must not be treated as empty: the next write would
+  // silently wipe every registration.
+  try {
+    const parsed = JSON.parse(raw);
+    parsed.repos ??= {};
+    return parsed;
+  } catch {
+    throw new McpError(
+      ErrorCode.InternalError,
+      `ecosystem.json is malformed (${ECOSYSTEM_PATH}) — fix or delete the file`
+    );
   }
 }
 
 async function writeEcosystem(data: Ecosystem): Promise<void> {
   await mkdir(ECOSYSTEM_ROOT, { recursive: true });
   await writeFileAtomic(ECOSYSTEM_PATH, JSON.stringify(data, null, 2));
+}
+
+const LOCK_TIMEOUT_MS = 5_000;
+// Generous: lock mtime comes from the filesystem server (Windows for /mnt/c),
+// whose clock can disagree with a WSL2 VM clock.
+const LOCK_STALE_MS = 30_000;
+
+/**
+ * Cross-process mutex around ecosystem.json read-modify-write cycles. Uses an
+ * O_EXCL lock file, which works on ext4, drvfs (/mnt/c) and NTFS alike, so
+ * bridge processes in Windows and in several WSL distros can share one
+ * ECOSYSTEM_ROOT without losing each other's updates.
+ */
+async function withEcosystemLock<T>(fn: () => Promise<T>): Promise<T> {
+  await mkdir(ECOSYSTEM_ROOT, { recursive: true });
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const fh = await open(ECOSYSTEM_LOCK_PATH, "wx");
+      await fh.writeFile(String(process.pid));
+      await fh.close();
+      break;
+    } catch (err) {
+      if (errorCode(err) !== "EEXIST") throw err;
+      try {
+        const st = await stat(ECOSYSTEM_LOCK_PATH);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          await rm(ECOSYSTEM_LOCK_PATH, { force: true });
+          continue;
+        }
+      } catch {
+        continue;  // lock vanished between open and stat — retry immediately
+      }
+      if (Date.now() > deadline) {
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Timed out waiting for ${ECOSYSTEM_LOCK_PATH} — delete it if no other bridge process is running`
+        );
+      }
+      await sleep(20 + Math.random() * 30);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(ECOSYSTEM_LOCK_PATH, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Re-read ecosystem.json under the lock, apply `mutate`, and write it back.
+ * Always use this for writes — never write a snapshot read earlier, or
+ * concurrent registrations/pins from other sessions get clobbered.
+ * `mutate` may return false to skip the write.
+ */
+async function updateEcosystem(
+  mutate: (eco: Ecosystem) => boolean | void
+): Promise<void> {
+  await withEcosystemLock(async () => {
+    const eco = await readEcosystem();
+    if (mutate(eco) === false) return;
+    await writeEcosystem(eco);
+  });
 }
 
 async function readManifest(): Promise<Record<string, unknown>> {
@@ -125,10 +210,32 @@ export async function writeFileAtomic(target: string, data: string): Promise<voi
   // The 4-byte random suffix prevents collisions when multiple atomic writes
   // to the same target happen within a single millisecond from the same pid
   // (e.g. Promise.all([writeFileAtomic(p, a), writeFileAtomic(p, b)])).
+  //
+  // On Windows (and on /mnt/c from WSL) rename-over-existing fails with
+  // EPERM/EBUSY/EACCES while another process — antivirus, indexer, a reader
+  // in another environment — holds the target open, so retry with backoff.
   const tmp = `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(tmp, data, "utf-8");
-  await rename(tmp, target);
+  try {
+    await writeFile(tmp, data, "utf-8");
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await rename(tmp, target);
+        return;
+      } catch (err) {
+        const code = errorCode(err);
+        const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+        if (!retryable || attempt >= RENAME_RETRIES) throw err;
+        await sleep(RENAME_BACKOFF_MS * 2 ** attempt);
+      }
+    }
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
+
+const RENAME_RETRIES = 6;
+const RENAME_BACKOFF_MS = 15;
 
 async function safeRead(path: string): Promise<string | null> {
   try {
@@ -169,11 +276,240 @@ async function listMdFiles(dir: string): Promise<string[]> {
 export function assertSafePath(resolvedPath: string, allowedRoots: string[]): void {
   const safe = allowedRoots.some((root) => {
     const rel = relative(root, resolvedPath);
-    return !rel.startsWith("..");
+    // `rel` is absolute when the path is on another Windows drive; a bare
+    // startsWith("..") check would also wrongly reject names like "..notes".
+    return (
+      rel !== ".." &&
+      !rel.startsWith(`..${sep}`) &&
+      !isAbsolute(rel)
+    );
   });
   if (!safe) {
     throw new McpError(ErrorCode.InvalidParams, "Path escapes allowed roots");
   }
+}
+
+// ─── Cross-environment paths (Windows ↔ WSL ↔ WSL) ───────────────────────────
+//
+// ecosystem.json may be shared by bridge processes running on Windows and in
+// several WSL distros, each of which sees the filesystem differently. Paths
+// are therefore stored in the one namespace that can address all of them —
+// the Windows view (`C:\...`, `\\wsl.localhost\<Distro>\...`) — and each
+// process translates to its own view when reading. On plain Linux/macOS
+// (no WSL) paths are stored as ordinary POSIX paths.
+
+export interface PathEnv {
+  platform: string;
+  /** WSL distro this process runs in (WSL_DISTRO_NAME), if any. */
+  wslDistro?: string;
+  /** Where Windows drives are mounted inside WSL (wsl.conf automount root). */
+  wslDrivesRoot: string;
+  /** Where other distros' root filesystems are bind-mounted inside WSL. */
+  wslDistrosRoot: string;
+}
+
+export function currentPathEnv(): PathEnv {
+  return {
+    platform: process.platform,
+    wslDistro:
+      process.platform === "win32" ? undefined : process.env.WSL_DISTRO_NAME || undefined,
+    wslDrivesRoot: posix.resolve(process.env.WSL_DRIVES_ROOT ?? "/mnt"),
+    wslDistrosRoot: posix.resolve(process.env.WSL_DISTROS_ROOT ?? "/mnt/wsl"),
+  };
+}
+
+type ParsedPath =
+  | { kind: "drive"; drive: string; segs: string[] }
+  | { kind: "wsl"; distro: string; segs: string[] }
+  | { kind: "unc"; raw: string }
+  | { kind: "posix"; segs: string[] };
+
+function toSegments(rest: string): string[] {
+  const out: string[] = [];
+  for (const s of rest.split(/[\\/]+/)) {
+    if (!s || s === ".") continue;
+    if (s === "..") out.pop();
+    else out.push(s);
+  }
+  return out;
+}
+
+/** Parse an absolute path in any of the supported notations; null if relative. */
+export function parseAnyPath(p: string): ParsedPath | null {
+  const drive = p.match(/^([A-Za-z]):(?:[\\/](.*))?$/s);
+  if (drive) {
+    return { kind: "drive", drive: drive[1].toUpperCase(), segs: toSegments(drive[2] ?? "") };
+  }
+  const wsl = p.match(/^[\\/]{2}wsl(?:\$|\.localhost)[\\/]+([^\\/]+)(?:[\\/](.*))?$/is);
+  if (wsl) return { kind: "wsl", distro: wsl[1], segs: toSegments(wsl[2] ?? "") };
+  if (/^[\\/]{2}[^\\/]/.test(p)) return { kind: "unc", raw: win32.normalize(p) };
+  if (p.startsWith("/")) return { kind: "posix", segs: toSegments(p) };
+  return null;
+}
+
+function startsWithSegs(segs: string[], prefix: string[]): boolean {
+  return prefix.length <= segs.length && prefix.every((s, i) => segs[i] === s);
+}
+
+function formatParsed(p: ParsedPath): string {
+  switch (p.kind) {
+    case "drive":
+      return `${p.drive}:\\${p.segs.join("\\")}`;
+    case "wsl":
+      return `\\\\wsl.localhost\\${p.distro}${p.segs.map((s) => `\\${s}`).join("")}`;
+    case "unc":
+      return p.raw;
+    case "posix":
+      return `/${p.segs.join("/")}`;
+  }
+}
+
+/**
+ * Convert an absolute path as seen by this process into the canonical form
+ * stored in ecosystem.json. Returns null for relative paths.
+ */
+export function toCanonicalPath(p: string, env: PathEnv = currentPathEnv()): string | null {
+  if (env.platform === "win32") {
+    // `/foo` on Windows means "root of the current drive"
+    const parsed = parseAnyPath(p.startsWith("/") && !p.startsWith("//") ? win32.resolve(p) : p);
+    return parsed ? formatParsed(parsed) : null;
+  }
+  const parsed = parseAnyPath(p);
+  if (!parsed) return null;
+  if (!env.wslDistro || parsed.kind !== "posix") return formatParsed(parsed);
+
+  const drivesRoot = toSegments(env.wslDrivesRoot);
+  const distrosRoot = toSegments(env.wslDistrosRoot);
+  const { segs } = parsed;
+
+  // /mnt/wsl/<Distro>/... — another distro's bind-mounted root (checked
+  // before drives: "/mnt/wsl" also sits under the default drives root)
+  if (startsWithSegs(segs, distrosRoot) && segs.length > distrosRoot.length) {
+    return formatParsed({
+      kind: "wsl",
+      distro: segs[distrosRoot.length],
+      segs: segs.slice(distrosRoot.length + 1),
+    });
+  }
+  // /mnt/c/... — a Windows drive
+  const letter = segs[drivesRoot.length];
+  if (startsWithSegs(segs, drivesRoot) && letter && /^[a-z]$/i.test(letter)) {
+    return formatParsed({
+      kind: "drive",
+      drive: letter.toUpperCase(),
+      segs: segs.slice(drivesRoot.length + 1),
+    });
+  }
+  // Anything else lives in this distro
+  return formatParsed({ kind: "wsl", distro: env.wslDistro, segs });
+}
+
+export type LocalPathResult = { path: string } | { error: string };
+
+/**
+ * Translate a stored (canonical or legacy) path into a path this process can
+ * open. Legacy entries — plain POSIX paths written by older versions from
+ * inside WSL — are still understood wherever they are unambiguous.
+ */
+export function toLocalPath(stored: string, env: PathEnv = currentPathEnv()): LocalPathResult {
+  const parsed = parseAnyPath(stored);
+  if (!parsed) return { error: `stored path "${stored}" is not absolute` };
+
+  if (env.platform === "win32") {
+    if (parsed.kind === "posix") {
+      const [mnt, letter, ...rest] = parsed.segs;
+      if (mnt === "mnt" && letter && /^[a-z]$/i.test(letter)) {
+        return { path: formatParsed({ kind: "drive", drive: letter.toUpperCase(), segs: rest }) };
+      }
+      return {
+        error:
+          `"${stored}" is a Linux path registered by an older bridge version and the WSL distro it ` +
+          "belongs to is unknown. Re-run bridge_register for this repo from inside WSL.",
+      };
+    }
+    return { path: formatParsed(parsed) };
+  }
+
+  if (env.wslDistro) {
+    switch (parsed.kind) {
+      case "posix":
+        return { path: formatParsed(parsed) };
+      case "drive":
+        return {
+          path: posix.join(env.wslDrivesRoot, parsed.drive.toLowerCase(), ...parsed.segs),
+        };
+      case "wsl":
+        if (parsed.distro.toLowerCase() === env.wslDistro.toLowerCase()) {
+          return { path: formatParsed({ kind: "posix", segs: parsed.segs }) };
+        }
+        return { path: posix.join(env.wslDistrosRoot, parsed.distro, ...parsed.segs) };
+      case "unc":
+        return { error: `network path "${stored}" is not reachable from WSL — mount it first` };
+    }
+  }
+
+  if (parsed.kind === "posix") return { path: formatParsed(parsed) };
+  return { error: `Windows path "${stored}" is not reachable from ${env.platform}` };
+}
+
+/** Explain how to make another distro's files visible, for error messages. */
+function foreignDistroHint(stored: string, env: PathEnv): string {
+  const parsed = parseAnyPath(stored);
+  if (
+    parsed?.kind !== "wsl" ||
+    !env.wslDistro ||
+    parsed.distro.toLowerCase() === env.wslDistro.toLowerCase()
+  ) {
+    return "";
+  }
+  const mountPoint = posix.join(env.wslDistrosRoot, parsed.distro);
+  return (
+    ` It lives in WSL distro "${parsed.distro}". Expose that distro's filesystem by running, ` +
+    `inside "${parsed.distro}": sudo mkdir -p ${mountPoint} && sudo mount --bind / ${mountPoint} ` +
+    "(add it to that distro's /etc/wsl.conf [boot] command to survive restarts)."
+  );
+}
+
+/**
+ * Resolve a stored path to a local directory that actually exists. The error
+ * explains why the directory is unreachable instead of letting reads fail
+ * silently.
+ */
+function resolveStoredDir(stored: string, label: string): LocalPathResult {
+  const env = currentPathEnv();
+  const local = toLocalPath(stored, env);
+  if ("error" in local) return { error: `${label}: ${local.error}` };
+  if (!existsSync(local.path)) {
+    return {
+      error: `${label}: not found at ${local.path} from this environment.${foreignDistroHint(stored, env)}`,
+    };
+  }
+  return local;
+}
+
+function repoRoot(name: string, entry: EcosystemEntry): LocalPathResult {
+  return resolveStoredDir(entry.path, `repo "${name}"`);
+}
+
+function repoContractsDir(name: string, entry: EcosystemEntry): LocalPathResult {
+  if (entry.contractsPath) {
+    return resolveStoredDir(entry.contractsPath, `contracts of "${name}"`);
+  }
+  const root = repoRoot(name, entry);
+  return "error" in root ? root : { path: join(root.path, ".context", "contracts") };
+}
+
+/** Read `<domain>.md` from another repo's contracts directory. */
+async function readRepoContract(
+  name: string,
+  entry: EcosystemEntry,
+  domain: string
+): Promise<{ content: string | null } | { error: string }> {
+  const dir = repoContractsDir(name, entry);
+  if ("error" in dir) return dir;
+  const file = join(dir.path, `${domain}.md`);
+  assertSafePath(file, [dir.path]);
+  return { content: await safeRead(file) };
 }
 
 // ─── Changelog helpers ────────────────────────────────────────────────────────
@@ -217,32 +553,29 @@ async function trackConsumedVersion(
   }
 
   const repoName = await currentRepoName();
-  const ecosystem = await readEcosystem();
-  const entry = ecosystem.repos[repoName];
-  if (!entry) return;  // repo not registered, can't track
+  await updateEcosystem((ecosystem) => {
+    const entry = ecosystem.repos[repoName];
+    if (!entry) return false;  // repo not registered, can't track
 
-  if (!entry.consumedVersions) {
-    entry.consumedVersions = {};
-  }
+    // Only update consumedAt when the version (or source) actually changes —
+    // makes the field mean "since when has this consumption been at this version"
+    const existing = entry.consumedVersions?.[domain];
+    if (existing && existing.version === version && existing.source === source) {
+      return false;  // no change, no write
+    }
 
-  // Only update consumedAt when the version (or source) actually changes —
-  // makes the field mean "since when has this consumption been at this version"
-  const existing = entry.consumedVersions[domain];
-  if (existing && existing.version === version && existing.source === source) {
-    return;  // no change, no write
-  }
-
-  entry.consumedVersions[domain] = {
-    version,
-    source,
-    consumedAt: new Date().toISOString(),
-  };
-  await writeEcosystem(ecosystem);
+    entry.consumedVersions ??= {};
+    entry.consumedVersions[domain] = {
+      version,
+      source,
+      consumedAt: new Date().toISOString(),
+    };
+  });
 }
 
 export function extractSummary(content: string): string {
   const line = content.split("\n").find((l) => l.trim().length > 0);
-  return (line ?? "").replace(/^#+\s*/, "").slice(0, 80);
+  return (line ?? "").trim().replace(/^#+\s*/, "").slice(0, 80);
 }
 
 async function currentRepoName(): Promise<string> {
@@ -288,23 +621,35 @@ export function watchMatchesEntry(
   return false;
 }
 
-async function readChangelog(): Promise<ChangelogEntry[]> {
+/**
+ * Read the changelog. Each entry carries its line index so callers can use a
+ * position cursor instead of timestamps: entries are written by processes on
+ * different clocks (a WSL2 VM clock can lag the Windows host after sleep),
+ * so "timestamp > lastCheckedAt" can skip entries. `lineCount` counts only
+ * complete lines — a trailing partial line may still be mid-append.
+ */
+async function readChangelog(): Promise<{
+  entries: Array<ChangelogEntry & { line: number }>;
+  lineCount: number;
+}> {
   let raw: string;
   try {
     raw = await readFile(CHANGELOG_PATH, "utf-8");
   } catch {
-    return [];
+    return { entries: [], lineCount: 0 };
   }
-  const entries: ChangelogEntry[] = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
+  const lines = raw.split("\n");
+  const lineCount = lines.length - 1;
+  const entries: Array<ChangelogEntry & { line: number }> = [];
+  for (let i = 0; i < lineCount; i++) {
+    if (!lines[i].trim()) continue;
     try {
-      entries.push(JSON.parse(line));
+      entries.push({ ...JSON.parse(lines[i]), line: i });
     } catch {
       // skip malformed lines
     }
   }
-  return entries;
+  return { entries, lineCount };
 }
 
 // ─── Tool schemas ─────────────────────────────────────────────────────────────
@@ -348,6 +693,7 @@ const RegisterSchema = z.object({
   path: z.string().min(1),
   exposes: z.array(z.string()).min(1),
   stack: z.string().optional(),
+  contractsPath: z.string().min(1).optional(),
 });
 
 const DiscoverSchema = z.object({
@@ -496,7 +842,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           path: {
             type: "string",
-            description: "Absolute path to the repo root",
+            description:
+              "Absolute path to the repo root, in any notation: /home/..., /mnt/c/..., C:\\..., " +
+              "or \\\\wsl.localhost\\<Distro>\\.... Stored in a form every Windows/WSL environment can translate.",
           },
           exposes: {
             type: "array",
@@ -507,6 +855,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           stack: {
             type: "string",
             description: "Tech stack description (e.g. 'Node.js / Nakama')",
+          },
+          contractsPath: {
+            type: "string",
+            description:
+              "Absolute path to the repo's contracts folder, only if it is NOT <path>/.context/contracts. " +
+              "Filled in automatically when registering the current repo with a custom CONTRACTS_ROOT.",
           },
         },
         required: ["name", "path", "exposes"],
@@ -642,7 +996,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const path = contextPath(CONTEXT_ROOT, domain, component);
       assertSafePath(path, [CONTEXT_ROOT]);
       await mkdir(join(CONTEXT_ROOT, domain), { recursive: true });
-      await writeFile(path, content, "utf-8");
+      await writeFileAtomic(path, content);
       await appendChangelog({
         timestamp: new Date().toISOString(),
         repo: await currentRepoName(),
@@ -665,6 +1019,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "bridge_list": {
       const { domain } = ListSchema.parse(args ?? {});
       const base = domain ? join(CONTEXT_ROOT, domain) : CONTEXT_ROOT;
+      assertSafePath(base, [CONTEXT_ROOT]);
       const keys = await listMdFiles(base);
       const prefix = domain ? `.context/${domain}/` : ".context/";
 
@@ -685,16 +1040,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "bridge_get_from": {
       const { repo, domain, component } = GetFromSchema.parse(args);
 
-      // Resolve repo name from ecosystem, or treat as relative/absolute path
-      let repoRoot: string;
+      // Resolve repo name from ecosystem, or treat as relative/absolute path.
+      // Absolute paths may use any notation (C:\..., \\wsl.localhost\..., /mnt/c/...).
       const ecosystem = await readEcosystem();
-      if (ecosystem.repos[repo]) {
-        repoRoot = resolve(ecosystem.repos[repo].path);
-      } else {
-        repoRoot = resolve(process.cwd(), repo);
+      const entry = ecosystem.repos[repo];
+      const resolved: LocalPathResult = entry
+        ? repoRoot(repo, entry)
+        : parseAnyPath(repo)
+          ? resolveStoredDir(toCanonicalPath(repo) ?? repo, `path "${repo}"`)
+          : { path: resolve(process.cwd(), repo) };
+      if ("error" in resolved) {
+        throw new McpError(ErrorCode.InvalidParams, resolved.error);
       }
-
-      const externalRoot = join(repoRoot, ".context");
+      const externalRoot = join(resolved.path, ".context");
       const path = contextPath(externalRoot, domain, component);
       assertSafePath(path, [externalRoot]);
 
@@ -738,15 +1096,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       // 2. Search ecosystem repos that expose "contracts"
       const ecosystem = await readEcosystem();
+      const unreachable: string[] = [];
       for (const [repoName, entry] of Object.entries(ecosystem.repos)) {
         if (!entry.exposes.includes("contracts")) continue;
-        const repoContractPath = join(
-          resolve(entry.path),
-          ".context",
-          "contracts",
-          `${domain}.md`
-        );
-        const repoContent = await safeRead(repoContractPath);
+        const result = await readRepoContract(repoName, entry, domain);
+        if ("error" in result) {
+          unreachable.push(result.error);
+          continue;
+        }
+        const repoContent = result.content;
         if (repoContent) {
           await trackConsumedVersion(domain, repoContent, repoName);
           return {
@@ -766,36 +1124,71 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         available.length > 0
           ? ` Ecosystem repos with contracts: ${available.join(", ")}.`
           : " No ecosystem repos expose contracts. Use bridge_register to add repos.";
+      const unreachableHint =
+        unreachable.length > 0
+          ? `\nUnreachable from this environment (not searched):\n${unreachable.map((u) => `  - ${u}`).join("\n")}`
+          : "";
       throw new McpError(
         ErrorCode.InvalidParams,
-        `No contract found for "${domain}" in local or ecosystem repos.${hint}`
+        `No contract found for "${domain}" in local or ecosystem repos.${hint}${unreachableHint}`
       );
     }
 
     // ── bridge_register ──────────────────────────────────────────────────
     case "bridge_register": {
-      const { name: repoName, path: repoPath, exposes, stack } =
+      const { name: repoName, path: repoPath, exposes, stack, contractsPath } =
         RegisterSchema.parse(args);
-      if (!isAbsolute(repoPath)) {
+      const canonicalPath = toCanonicalPath(repoPath);
+      if (!canonicalPath) {
         throw new McpError(
           ErrorCode.InvalidParams,
           `path must be absolute (got: "${repoPath}"). Use an absolute path to the repo root.`
         );
       }
-      const resolvedPath = resolve(repoPath);
-      const ecosystem = await readEcosystem();
-      ecosystem.repos[repoName] = {
-        path: resolvedPath,
-        exposes,
-        stack,
-        registeredAt: new Date().toISOString().slice(0, 10),
-      };
-      await writeEcosystem(ecosystem);
+
+      // Contracts outside <repo>/.context/contracts must be recorded so other
+      // repos can find them. Registering the current repo with a custom
+      // CONTRACTS_ROOT fills this in automatically.
+      let canonicalContracts: string | undefined;
+      if (contractsPath) {
+        canonicalContracts = toCanonicalPath(contractsPath) ?? undefined;
+        if (!canonicalContracts) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `contractsPath must be absolute (got: "${contractsPath}").`
+          );
+        }
+      } else {
+        const local = toLocalPath(canonicalPath);
+        const isCurrentRepo =
+          "path" in local && resolve(local.path) === resolve(CONTEXT_ROOT, "..");
+        if (isCurrentRepo && CONTRACTS_ROOT !== join(CONTEXT_ROOT, "contracts")) {
+          canonicalContracts = toCanonicalPath(CONTRACTS_ROOT) ?? undefined;
+        }
+      }
+
+      await updateEcosystem((ecosystem) => {
+        const previous = ecosystem.repos[repoName];
+        ecosystem.repos[repoName] = {
+          // Re-registering must not reset this repo's pins and changelog cursor
+          ...previous,
+          path: canonicalPath,
+          contractsPath: canonicalContracts,
+          exposes,
+          stack,
+          registeredAt: new Date().toISOString().slice(0, 10),
+        };
+        if (!canonicalContracts) delete ecosystem.repos[repoName].contractsPath;
+      });
+
+      const reach = resolveStoredDir(canonicalPath, `repo "${repoName}"`);
+      const warning =
+        "error" in reach ? `\n  ⚠ ${reach.error}` : "";
       return {
         content: [
           {
             type: "text",
-            text: `✓ Registered "${repoName}"\n  exposes: ${exposes.join(", ")}${stack ? `\n  stack: ${stack}` : ""}`,
+            text: `✓ Registered "${repoName}"\n  exposes: ${exposes.join(", ")}${stack ? `\n  stack: ${stack}` : ""}${warning}`,
           },
         ],
       };
@@ -816,16 +1209,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           );
         }
         // Try to read that repo's manifest for extra detail
-        const repoManifest = await safeRead(
-          join(resolve(entry.path), ".context", "manifest.json")
-        );
+        const root = repoRoot(repoName, entry);
+        const repoManifest =
+          "path" in root
+            ? await safeRead(join(root.path, ".context", "manifest.json"))
+            : null;
         // Return details without exposing the absolute path
         const detail: Record<string, unknown> = {
           name: repoName,
           exposes: entry.exposes,
           stack: entry.stack,
           registeredAt: entry.registeredAt,
+          reachable: "path" in root,
         };
+        if ("error" in root) detail.unreachableReason = root.error;
         if (repoManifest) {
           try {
             detail.manifest = JSON.parse(repoManifest);
@@ -852,10 +1249,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           ],
         };
       }
-      const lines = repos.map(
-        ([n, e]) =>
-          `  - ${n} (${e.stack ?? "unknown stack"})\n    exposes: ${e.exposes.join(", ")}`
-      );
+      const lines = repos.map(([n, e]) => {
+        const reach = repoRoot(n, e);
+        const flag = "error" in reach ? "\n    ⚠ unreachable from this environment" : "";
+        return `  - ${n} (${e.stack ?? "unknown stack"})\n    exposes: ${e.exposes.join(", ")}${flag}`;
+      });
       return {
         content: [
           { type: "text", text: `Ecosystem repos:\n\n${lines.join("\n\n")}` },
@@ -869,7 +1267,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const path = contractPath(domain);
       assertSafePath(path, [CONTRACTS_ROOT]);
       await mkdir(CONTRACTS_ROOT, { recursive: true });
-      await writeFile(path, content, "utf-8");
+      await writeFileAtomic(path, content);
       await appendChangelog({
         timestamp: new Date().toISOString(),
         repo: await currentRepoName(),
@@ -934,21 +1332,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const ecosystem = await readEcosystem();
       const myEntry = ecosystem.repos[repoName];
 
-      // Determine cursor: explicit `since`, or this repo's lastCheckedAt, or epoch
-      let cursor: string;
-      if (since) {
-        cursor = since;
-      } else if (myEntry?.lastCheckedAt) {
-        cursor = myEntry.lastCheckedAt;
-      } else {
-        cursor = "1970-01-01T00:00:00Z";
-      }
-
       // ── Part 1: changelog entries since cursor ──
-      const allEntries = await readChangelog();
+      // Default cursor is a line position, immune to clock skew between the
+      // Windows host and WSL2 VMs. An explicit `since`, or a repo that has
+      // never checked (or a truncated changelog), falls back to timestamps.
+      const { entries: allEntries, lineCount } = await readChangelog();
+      const lineCursor =
+        !since &&
+        myEntry?.changelogCursor !== undefined &&
+        myEntry.changelogCursor <= lineCount
+          ? myEntry.changelogCursor
+          : undefined;
+      const cursor = since ?? myEntry?.lastCheckedAt ?? "1970-01-01T00:00:00Z";
+
       const relevant = allEntries.filter((e) => {
         if (e.repo === repoName) return false;
-        if (e.timestamp <= cursor) return false;
+        if (lineCursor !== undefined ? e.line < lineCursor : e.timestamp <= cursor) {
+          return false;
+        }
         if (watches) {
           const watchList = watches[e.repo];
           if (!watchList) return false;
@@ -974,21 +1375,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const consumed = myEntry?.consumedVersions ?? {};
 
       for (const [contractDomain, pin] of Object.entries(consumed)) {
+        const sourceEntry = ecosystem.repos[pin.source];
         // Source repo no longer in ecosystem — surface as orphan dependency
-        if (!ecosystem.repos[pin.source]) {
+        if (!sourceEntry) {
           driftLines.push(
             `  ⚠ contract "${contractDomain}": pinned to v${pin.version} from "${pin.source}", but "${pin.source}" is no longer registered in the ecosystem`
           );
           continue;
         }
 
-        const sourcePath = join(
-          resolve(ecosystem.repos[pin.source].path),
-          ".context",
-          "contracts",
-          `${contractDomain}.md`
-        );
-        const currentContent = await safeRead(sourcePath);
+        const result = await readRepoContract(pin.source, sourceEntry, contractDomain);
+        if ("error" in result) {
+          driftLines.push(
+            `  ⚠ contract "${contractDomain}": pinned to v${pin.version}, but drift cannot be checked — ${result.error}`
+          );
+          continue;
+        }
+        const currentContent = result.content;
 
         if (!currentContent) {
           driftLines.push(
@@ -1006,10 +1409,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       }
 
-      // ── Update lastCheckedAt cursor ──
+      // ── Update cursors — re-read under lock, touch only our own entry ──
       if (myEntry) {
-        myEntry.lastCheckedAt = new Date().toISOString();
-        await writeEcosystem(ecosystem);
+        await updateEcosystem((eco) => {
+          const entry = eco.repos[repoName];
+          if (!entry) return false;
+          entry.lastCheckedAt = new Date().toISOString();
+          entry.changelogCursor = lineCount;
+        });
       }
 
       // ── Build response ──

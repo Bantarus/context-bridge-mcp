@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeFileAtomic } from "../../src/index.js";
@@ -49,5 +49,14 @@ describe("writeFileAtomic", () => {
     // failure (bad parent dir) propagates as a thrown error.
     const target = join(dir, "missing-subdir", "file.txt");
     await expect(writeFileAtomic(target, "data")).rejects.toThrow();
+  });
+
+  it("removes its temp file when the rename fails", async () => {
+    // Renaming a file over a non-empty directory fails with a non-retryable error
+    const target = join(dir, "occupied");
+    mkdirSync(join(target, "child"), { recursive: true });
+    await expect(writeFileAtomic(target, "data")).rejects.toThrow();
+    const remaining = readdirSync(dir).filter((f) => f.endsWith(".tmp"));
+    expect(remaining).toEqual([]);
   });
 });

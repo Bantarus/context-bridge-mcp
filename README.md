@@ -94,6 +94,8 @@ another repo and reads its `.context/` folder.
 | `CONTEXT_ROOT` | `$CWD/.context` | Path to the context directory |
 | `CONTRACTS_ROOT` | `$CONTEXT_ROOT/contracts` | Path to contracts (can be shared across repos) |
 | `ECOSYSTEM_ROOT` | `~/.context-bridge` | Path to the shared ecosystem registry |
+| `WSL_DRIVES_ROOT` | `/mnt` | (WSL only) where Windows drives are mounted — match `automount.root` in `/etc/wsl.conf` |
+| `WSL_DISTROS_ROOT` | `/mnt/wsl` | (WSL only) where other WSL distros' filesystems are bind-mounted |
 
 ---
 
@@ -378,43 +380,70 @@ to understand the delta before writing any code against a stale interface.
 
 ## WSL + Windows cross-environment usage
 
-The bridge works between repos in the same environment (WSL-to-WSL or
-Windows-to-Windows) with no extra setup. Cross-environment usage (WSL repo
-talking to a Windows repo or vice versa) requires using cross-filesystem
-mount paths when registering.
+One ecosystem can span the Windows host and any number of WSL2 distros. Each
+environment runs its own bridge process; they share a single
+`ecosystem.json` and translate paths to their own view of the filesystem.
 
-**If the MCP server runs in WSL**, register Windows projects via `/mnt/c/`:
+**1. Point every environment at the same `ECOSYSTEM_ROOT`** on the Windows
+drive, the only location all of them can reach:
 
-```
-bridge_register({
-  name: "my-windows-project",
-  path: "/mnt/c/Users/you/projects/my-app",
-  exposes: ["contracts", "api"],
-  stack: "..."
-})
+```bash
+# In each WSL distro (e.g. Ubuntu and Ubuntu-24.04)
+claude mcp add --scope user --transport stdio context-bridge \
+  --env ECOSYSTEM_ROOT=/mnt/c/Users/you/.context-bridge \
+  -- node /path/to/context-bridge-mcp/dist/index.js
 ```
 
-**If the MCP server runs on Windows**, register WSL projects via the UNC path:
-
-```
-bridge_register({
-  name: "my-wsl-project",
-  path: "\\\\wsl$\\Ubuntu\\home\\you\\DEV\\my-app",
-  exposes: ["contracts"],
-  stack: "..."
-})
+```powershell
+# On Windows
+claude mcp add --scope user --transport stdio context-bridge `
+  --env ECOSYSTEM_ROOT=C:\Users\you\.context-bridge `
+  -- node C:\path\to\context-bridge-mcp\dist\index.js
 ```
 
-**Caveats:**
+**2. Register repos with any absolute path.** `bridge_register` accepts
+`/home/...`, `/mnt/c/...`, `C:\...` or `\\wsl.localhost\<Distro>\...` and
+stores it in Windows notation, which every environment can translate:
 
-- `/mnt/c/` access from WSL has a performance overhead (filesystem bridge)
-- File watching does not work across the boundary
-- Two separate Claude Code instances (one in WSL, one in Windows) need two
-  MCP server processes, but can share the same `ecosystem.json` by setting
-  `ECOSYSTEM_ROOT` to a path both environments can access
+| Registered from | You pass | Stored as |
+|---|---|---|
+| WSL `Ubuntu` | `/home/you/api` | `\\wsl.localhost\Ubuntu\home\you\api` |
+| WSL `Ubuntu` | `/mnt/c/Users/you/Client` | `C:\Users\you\Client` |
+| Windows | `C:\Users\you\Client` | `C:\Users\you\Client` |
 
-**Recommendation:** keep all repos in the same environment (ideally WSL).
-Use cross-mount paths only when you have no choice.
+When reading, a WSL bridge maps `C:\...` to `/mnt/c/...` and its own distro's
+UNC path back to `/...`; a Windows bridge uses the stored path directly.
+
+**3. For WSL ↔ WSL, expose each distro's filesystem to the others.** Distros
+cannot see each other's files by default. `/mnt/wsl` is shared by all
+distros, so bind-mount each distro's root there — inside that distro's
+`/etc/wsl.conf`:
+
+```ini
+[boot]
+command = mkdir -p /mnt/wsl/Ubuntu-24.04 && mount --bind / /mnt/wsl/Ubuntu-24.04
+```
+
+(use the distro's own name; takes effect after `wsl --shutdown`). A bridge in
+`Ubuntu` then reads `\\wsl.localhost\Ubuntu-24.04\...` via
+`/mnt/wsl/Ubuntu-24.04/...`. If the mount is missing, tools say so and print
+the command to run instead of failing silently.
+
+**Notes:**
+
+- `bridge_discover` flags repos that are unreachable from the current
+  environment; `bridge_get_contract` lists them alongside "not found".
+- Entries written by older versions as plain Linux paths still work inside
+  the distro that wrote them. Re-run `bridge_register` for them (from that
+  distro) so Windows and other distros can resolve them too.
+- `bridge_changes` tracks its position in `changelog.jsonl` by line, not by
+  timestamp, so a WSL2 clock that lags the host after sleep never hides
+  entries.
+- Concurrent writes to `ecosystem.json` from all environments are serialized
+  with a lock file (`ecosystem.lock`); if a crashed process leaves one
+  behind, it is considered stale after 30 s.
+- `/mnt/c` and `\\wsl.localhost` access is slower than native filesystem
+  access; keep each repo on the side where you edit it most.
 
 ---
 

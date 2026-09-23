@@ -19,9 +19,11 @@ folders in each repo. It acts as the shared context layer for how repos
 communicate. Each repo owns its own `.context/` — the server has zero
 project-specific knowledge.
 
-Repos register themselves in a shared ecosystem (`~/.context-bridge/ecosystem.json`)
-so they can discover each other automatically. Contracts are resolved across the
-ecosystem — no hardcoded paths needed.
+Repos register themselves in a shared ecosystem (`ecosystem.json` under
+`ECOSYSTEM_ROOT`, default `~/.context-bridge`) so they can discover each other
+automatically. Contracts are resolved across the ecosystem — no hardcoded paths
+needed. One ecosystem can span the Windows host and several WSL distros when
+they share an `ECOSYSTEM_ROOT`; the server translates paths per environment.
 
 ---
 
@@ -282,6 +284,14 @@ bridge_register({
 
 Include `"contracts"` in `exposes` so `bridge_get_contract` can auto-resolve
 contracts from this repo.
+
+`path` may be in any absolute notation (`/home/...`, `/mnt/c/...`, `C:\...`,
+`\\wsl.localhost\<Distro>\...`) — pass the repo root as this environment sees
+it. If contracts live outside `<path>/.context/contracts`, also pass
+`contractsPath` (filled in automatically when registering the current repo
+with a custom `CONTRACTS_ROOT`). Re-registering keeps the repo's consumed
+contract pins. If the response warns the repo is unreachable, relay the
+instructions to the user — do not retry with a different path format.
 
 ### Step 4 — Install companion skills
 

@@ -40,4 +40,8 @@ describe("extractSummary", () => {
       "first line"
     );
   });
+
+  it("drops the carriage return from CRLF content", () => {
+    expect(extractSummary("# Title\r\nbody\r\n")).toBe("Title");
+  });
 });

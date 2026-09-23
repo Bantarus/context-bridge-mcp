@@ -137,7 +137,10 @@ bridge_register({
 
 This lets other repos discover this one via `bridge_discover()`.
 Include `"contracts"` in `exposes` if this repo has API contracts
-that other repos should be able to find automatically.
+that other repos should be able to find automatically. Pass `contractsPath`
+only if contracts live outside `.context/contracts`. Any absolute path
+notation works (`/home/...`, `/mnt/c/...`, `C:\...`) — the server stores a
+form that Windows and every WSL distro can resolve.
 
 **5. Install companion skills**
 

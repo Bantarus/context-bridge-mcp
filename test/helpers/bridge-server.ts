@@ -87,11 +87,18 @@ export async function startBridge(
     "utf-8"
   );
 
+  // Run as plain Linux regardless of where the suite runs: inside WSL the
+  // bridge would otherwise canonicalize registered paths to
+  // \\wsl.localhost\<distro>\... and diverge from CI. WSL behavior is
+  // covered by tests that set WSL_DISTRO_NAME explicitly.
+  const { WSL_DISTRO_NAME: _wslDistro, ...parentEnv } =
+    process.env as Record<string, string>;
+
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [BRIDGE_DIST],
     env: {
-      ...(process.env as Record<string, string>),
+      ...parentEnv,
       CONTEXT_ROOT: ctxRoot,
       ECOSYSTEM_ROOT: ecoRoot,
       ...(options.env ?? {}),

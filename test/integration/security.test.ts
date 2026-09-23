@@ -28,6 +28,15 @@ describe("security — path traversal across tools", () => {
     ).rejects.toThrow(/escapes allowed roots|path/i);
   });
 
+  it("bridge_list rejects a domain that escapes the context root", async () => {
+    await expect(
+      bridge.client.callTool({
+        name: "bridge_list",
+        arguments: { domain: "../../../.." },
+      })
+    ).rejects.toThrow(/escapes allowed roots/i);
+  });
+
   it("bridge_update rejects a component that escapes the domain", async () => {
     await expect(
       bridge.client.callTool({

@@ -25,10 +25,13 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 - `CONTEXT_ROOT` — path to the `.context/` directory. Defaults to `$CWD/.context`.
 - `CONTRACTS_ROOT` — path to contracts. Defaults to `$CONTEXT_ROOT/contracts`. Can be overridden to point to a shared location.
 - `ECOSYSTEM_ROOT` — path to the shared ecosystem registry. Defaults to `~/.context-bridge`. Contains `ecosystem.json` which tracks all registered repos.
+- `WSL_DRIVES_ROOT` / `WSL_DISTROS_ROOT` — WSL only: where Windows drives (`/mnt`) and other distros' bind-mounted roots (`/mnt/wsl`) live. `WSL_DISTRO_NAME` (set by WSL) switches on WSL path translation.
 
 **Boot behavior:** on startup the server creates `CONTEXT_ROOT` and `ECOSYSTEM_ROOT` if missing, and writes a default `manifest.json` (`{ "version": "1.0", "domains": {} }`) if one doesn't exist. This means a freshly-cloned repo gets a usable bridge state on the first MCP tool call without any setup.
 
-**Concurrency:** writes to `manifest.json` and `ecosystem.json` are atomic (write-then-rename via `writeFileAtomic`), so concurrent sessions never see a torn file. Lost updates from concurrent writes to the *same* file are still possible but rare in practice — most operations are per-repo and the changelog uses append-safe `appendFile`.
+**Concurrency:** all file writes are atomic (write-then-rename via `writeFileAtomic`, which retries `EPERM`/`EBUSY` renames on Windows/drvfs), so readers never see a torn file. Every `ecosystem.json` read-modify-write goes through `updateEcosystem()`, which re-reads under a cross-process `ecosystem.lock` (O_EXCL lock file) — never write back an ecosystem snapshot read earlier. A malformed `ecosystem.json` throws instead of being treated as empty. The changelog uses append-safe `appendFile`; `bridge_changes` tracks a per-repo line cursor (`changelogCursor`) rather than timestamps, because entries come from processes on different clocks.
+
+**Cross-environment paths:** one ecosystem can be shared by bridges on Windows and in several WSL distros. `bridge_register` stores paths in canonical Windows notation (`C:\...`, `\\wsl.localhost\<Distro>\...`) via `toCanonicalPath()`; every read goes through `toLocalPath()` / `repoRoot()` / `repoContractsDir()`, which translate to the local view and return an explanatory error when a repo is unreachable. Never `resolve(entry.path)` directly. Entries may also carry `contractsPath` when contracts live outside `<repo>/.context/contracts`.
 
 ### `.context/` directory structure
 
@@ -54,7 +57,7 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 
 ### Security
 
-`assertSafePath()` validates that all resolved file paths stay within allowed roots (`CONTEXT_ROOT`, `CONTRACTS_ROOT`, or an explicit external root for `bridge_get_from`) to prevent path traversal.
+`assertSafePath()` validates that all resolved file paths stay within allowed roots (`CONTEXT_ROOT`, `CONTRACTS_ROOT`, or an explicit external root for `bridge_get_from`) to prevent path traversal. It rejects `..` escapes and cross-drive (absolute) relatives. Every tool that takes a `domain`/`component` must call it — including listing tools.
 
 ### Deep merge
 

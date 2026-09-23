@@ -58,4 +58,16 @@ describe("assertSafePath", () => {
       /escapes allowed roots/i
     );
   });
+
+  it("allows a child whose name merely starts with '..'", () => {
+    expect(() =>
+      assertSafePath(resolve(root, "..notes/file.md"), [root])
+    ).not.toThrow();
+  });
+
+  it("rejects the literal parent '..'", () => {
+    expect(() =>
+      assertSafePath(resolve(root, ".."), [root])
+    ).toThrow(/escapes allowed roots/i);
+  });
 });

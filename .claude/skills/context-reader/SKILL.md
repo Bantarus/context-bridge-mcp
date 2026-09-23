@@ -119,6 +119,12 @@ bridge_discover("<repo-name>")   // details + manifest of a specific repo
 Use when the manifest doesn't list components explicitly, or when you need
 to find a file whose name you don't know.
 
+Repos may live in another environment (Windows host, another WSL distro).
+`bridge_discover` marks repos that are unreachable from here, and
+`bridge_get_from` / `bridge_get_contract` / `bridge_changes` explain why
+(e.g. a missing `/mnt/wsl/<Distro>` bind mount). Tell the user how to fix
+it rather than assuming the file doesn't exist.
+
 ---
 
 ## Fetch decision tree
