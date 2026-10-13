@@ -140,12 +140,15 @@ another repo and reads its `.context/` folder.
 | `bridge_list` | Discover existing files, optionally filtered by domain |
 | `bridge_get_from` | Fetch a context file from another repo by path |
 | `bridge_register` | Register a repo in the shared ecosystem |
-| `bridge_discover` | List or inspect repos in the ecosystem |
+| `bridge_discover` | List or inspect repos in the ecosystem, with the skills they publish |
 | `bridge_get_contract` | Fetch a contract — searches local then ecosystem |
 | `bridge_update_contract` | Write a contract file |
 | `bridge_list_contracts` | List all contracts |
-| `bridge_changes` | Show changes from other repos since last check |
-| `bridge_sync_skills` | Install/update companion skills into current repo |
+| `bridge_changes` | Show changes from other repos since last check, plus contract and skill drift |
+| `bridge_sync_skills` | Install/update companion skills and every skill installed from other repos |
+| `bridge_install_skill` | Install a skill another repo publishes into `.claude/skills/` |
+| `bridge_uninstall_skill` | Remove a skill installed with `bridge_install_skill` |
+| `bridge_publish_skill` | Publish (or re-publish) a skill from `.context/skills/<name>/` |
 | `bridge_manifest_update` | Deep-merge a patch into manifest.json |
 
 ---
@@ -169,6 +172,9 @@ your-repo/
       session.md
     events/                <- example domain
       user-events.md
+    skills/                <- optional: skills this repo publishes to others
+      asset-library/
+        SKILL.md
 ```
 
 ---
@@ -394,6 +400,59 @@ Version drift detected (1):
 
 This means the agent knows exactly what changed and can re-fetch the contract
 to understand the delta before writing any code against a stale interface.
+
+### Sharing skills between repos
+
+A repo can publish Claude Code skills that teach other repos' agents to use
+something it provides, such as a local CLI. Other repos install a copy and
+the bridge keeps it up to date.
+
+**Publish** (provider repo). Put the skill in `.context/skills/<name>/`
+(`SKILL.md` plus any files next to it) with a version in its frontmatter,
+add `"skills"` to the repo's `exposes` in `bridge_register`, then:
+
+```markdown
+---
+name: asset-library
+description: Find and copy 3D models from the asset library.
+metadata:
+  version: 1.0.0
+---
+```
+
+```
+bridge_publish_skill("asset-library")     ← records skills.asset-library.version in the manifest
+```
+
+Bump `metadata.version` and publish again after each change. Consumers only
+see a change when the version changes. Each publish is logged to the
+changelog (`world-builder-studio updated skill "asset-library" → 1.0.0 -> 1.1.0`).
+A version change made with `bridge_manifest_update` is logged too.
+
+**Install** (consumer repo):
+
+```
+bridge_discover()                                         ← lists each repo's skills
+bridge_install_skill("world-builder-studio", "asset-library")
+```
+
+This copies the folder into `.claude/skills/asset-library/` and records
+`installedSkills.asset-library = { from, version }` in the manifest. It
+installs at project level only, never into `~/.claude/skills`. Later:
+
+- `bridge_changes` reports when the provider publishes a newer version, or
+  stops publishing the skill.
+- `bridge_sync_skills` refreshes the bridge's own skills **and** every
+  installed skill. It deletes files the provider removed.
+- `bridge_uninstall_skill("asset-library")` removes the folder and the
+  manifest entry.
+
+**Rules.** Skills install only from registered repos that expose `skills`.
+Providers on the Windows host and in other WSL distros are reached the same
+way as contracts. Files are copied byte for byte (scripts, CRLF and absolute
+provider paths stay as they are), symlinks are skipped, and nothing is run.
+The bridge never overwrites a `.claude/skills/<name>/` folder it didn't
+install unless you pass `force: true`, and never uninstalls one.
 
 ### Tips
 

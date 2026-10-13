@@ -46,10 +46,15 @@ From the manifest, extract:
 From the ecosystem, extract:
 - What other repos exist on this machine
 - What domains each repo exposes publicly
+- Which skills each repo publishes (`skill: <name> <version>` lines). If the
+  task needs one that isn't in this repo's `.claude/skills/` yet, suggest
+  `bridge_install_skill("<repo>", "<skill>")`
 
 From changes, extract:
 - What context or contracts changed in other repos since last session
 - Whether any of those changes affect what you're about to work on
+- Skill drift (`skill "<name>": installed vX ..., provider now publishes vY`):
+  run `bridge_sync_skills()` before relying on that skill
 
 Do not proceed until you've read all three.
 
@@ -113,7 +118,7 @@ Prefer `bridge_get_contract` for normal cross-repo work.
 bridge_list()                    // all files in this repo's .context/
 bridge_list("<domain>")          // files in one domain
 bridge_discover()                // all repos in the ecosystem
-bridge_discover("<repo-name>")   // details + manifest of a specific repo
+bridge_discover("<repo-name>")   // details, manifest and published skills of a repo
 ```
 
 Use when the manifest doesn't list components explicitly, or when you need

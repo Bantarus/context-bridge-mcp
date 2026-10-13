@@ -68,6 +68,12 @@ drift warnings) are cheaper than false negatives (silent breakage).
 After scaffolding a new repo, call `bridge_register` so other repos can
 discover it via `bridge_discover`.
 
+**Rule 7 — Republish skills you change.**
+If this repo publishes skills (`.context/skills/<name>/SKILL.md`, listed under
+`skills` in the manifest), then after editing one, bump `metadata.version` in
+its frontmatter and call `bridge_publish_skill("<name>")`. Consumers only see
+version changes. The repo must have `"skills"` in its `exposes`.
+
 ---
 
 ## Workflow
@@ -290,6 +296,7 @@ Run through this after every implementation session:
 - [ ] If interface changed: `bridge_update_contract("<domain>")` with changelog
 - [ ] If new file created: manifest updated via `bridge_manifest_update`
 - [ ] If new repo: registered via `bridge_register`
+- [ ] If a published skill changed: version bumped + `bridge_publish_skill("<name>")`
 - [ ] "Last updated" date is today
 - [ ] No internal implementation details leaked into context files
 

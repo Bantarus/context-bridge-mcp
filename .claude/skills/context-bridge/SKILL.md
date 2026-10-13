@@ -47,6 +47,7 @@ Fetch only what you need for the current task:
 | Cross-repo data mismatch           | Contract + context files from both sides via `bridge_get_from`           |
 | Don't know what exists             | `bridge_list()` or `bridge_list(<domain>)`                               |
 | Don't know which repo owns something | `bridge_discover()` — lists all repos and exposed domains              |
+| Need a tool another repo provides  | `bridge_discover()` for its published skills, then `bridge_install_skill(<repo>, <skill>)` |
 
 ### Rule 3 — Contracts are the boundary
 
@@ -91,6 +92,23 @@ bridge_register({
   stack: "<tech stack>"
 })
 ```
+
+### Rule 6 — Share tools as skills, not copies
+
+When a repo offers something other repos should *use* (a CLI, a pipeline),
+it publishes a skill instead of each consumer copying instructions by hand:
+
+- **Provider:** put it in `.context/skills/<name>/SKILL.md` with
+  `metadata.version` in the frontmatter, include `"skills"` in `exposes`, and
+  call `bridge_publish_skill("<name>")`. Bump the version and publish again on
+  every change, because consumers only see version changes.
+- **Consumer:** `bridge_install_skill("<repo>", "<name>")` copies it into
+  `.claude/skills/<name>/`. When `bridge_changes` reports
+  `skill "<name>": installed vX ..., provider now publishes vY`, run
+  `bridge_sync_skills()`. `bridge_uninstall_skill("<name>")` removes it.
+- If install refuses because `.claude/skills/<name>/` already exists and the
+  bridge didn't install it, ask the user before passing `force: true`. That
+  folder is someone's local skill.
 
 ---
 
@@ -300,7 +318,8 @@ bridge_sync_skills()
 ```
 
 Copies context-reader, context-feeder, and context-bridge skills into this
-repo's `.claude/skills/`.
+repo's `.claude/skills/`, and refreshes any skills installed from other repos
+with `bridge_install_skill`.
 
 ### Step 5 — Verify discoverability
 

@@ -19,7 +19,7 @@ The project uses ESM (`"type": "module"`) with `tsconfig.json` targeting ES2022 
 
 ## Architecture
 
-The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 13 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories, a shared `ecosystem.json`, and an append-only `changelog.jsonl`.
+The entire server is a single file: `src/index.ts`. It uses the `@modelcontextprotocol/sdk` to expose 16 tools over stdio transport. There is no HTTP server, no database — just filesystem reads/writes against `.context/` directories, a shared `ecosystem.json`, and an append-only `changelog.jsonl`.
 
 **Key env vars:**
 - `CONTEXT_ROOT` — path to the `.context/` directory. Defaults to `$CWD/.context`.
@@ -53,7 +53,9 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 - `bridge_register` / `bridge_discover` — register repos in the ecosystem and discover them
 - `bridge_get_contract` / `bridge_update_contract` / `bridge_list_contracts` — read/write/list API contracts. `bridge_get_contract` searches local repo first, then all ecosystem repos that expose "contracts". Automatically pins the consumed contract version in the ecosystem for drift detection
 - `bridge_changes` — show changes from other repos and detect contract version drift. Compares consumed versions (pinned by `bridge_get_contract`) against current versions. Also shows changelog entries filtered by `watches` in manifest. Mutation tools (`bridge_update`, `bridge_update_contract`, `bridge_manifest_update`) automatically append to `changelog.jsonl`
-- `bridge_sync_skills` — install/update companion skills (context-reader, context-feeder, context-bridge) into the current repo's `.claude/skills/`
+- `bridge_sync_skills` — install/update companion skills (context-reader, context-feeder, context-bridge) into the current repo's `.claude/skills/`, and refresh every skill listed in the manifest's `installedSkills` from its provider
+- `bridge_install_skill` / `bridge_uninstall_skill` — copy a skill another ecosystem repo publishes (`<repo>/.context/skills/<name>/`, repo must expose "skills") into `<cwd>/.claude/skills/<name>/`, recorded as `installedSkills.<name> = { from, version }`; uninstall removes both. Byte-for-byte copy, symlinks skipped, nothing executed; never touches a skill folder the bridge didn't install unless `force`
+- `bridge_publish_skill` — provider side: record `skills.<name>.version` (from SKILL.md `metadata.version`) in the manifest and log a `type: "skill"` changelog entry. `bridge_manifest_update` also logs skill version changes. `bridge_discover` lists published skills; `bridge_changes` reports installed-skill drift and always shows updates to installed skills
 
 ### Security
 

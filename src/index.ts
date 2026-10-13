@@ -7,7 +7,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { readFile, writeFile, appendFile, readdir, mkdir, rename, open, stat, rm } from "fs/promises";
+import { readFile, writeFile, appendFile, readdir, mkdir, rename, open, stat, rm, chmod } from "fs/promises";
 import { join, resolve, relative, isAbsolute, sep, posix, win32 } from "path";
 import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
@@ -67,7 +67,7 @@ interface Ecosystem {
 interface ChangelogEntry {
   timestamp: string;
   repo: string;
-  type: "context" | "contract" | "manifest";
+  type: "context" | "contract" | "manifest" | "skill";
   domain: string;
   component: string | null;
   summary: string;
@@ -204,7 +204,7 @@ function contractPath(domain: string): string {
   return join(CONTRACTS_ROOT, `${domain}.md`);
 }
 
-export async function writeFileAtomic(target: string, data: string): Promise<void> {
+export async function writeFileAtomic(target: string, data: string | Uint8Array): Promise<void> {
   // Write to a sibling temp file then rename — rename is atomic so readers
   // never see a torn file, and a crash mid-write leaves the original intact.
   // The 4-byte random suffix prevents collisions when multiple atomic writes
@@ -216,7 +216,7 @@ export async function writeFileAtomic(target: string, data: string): Promise<voi
   // in another environment — holds the target open, so retry with backoff.
   const tmp = `${target}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    await writeFile(tmp, data, "utf-8");
+    await writeFile(tmp, data, typeof data === "string" ? "utf-8" : undefined);
     for (let attempt = 0; ; attempt++) {
       try {
         await rename(tmp, target);
@@ -513,6 +513,311 @@ async function readRepoContract(
   return { content: await safeRead(file) };
 }
 
+// ─── Published skills ─────────────────────────────────────────────────────────
+//
+// A repo publishes skills under `.context/skills/<name>/` (SKILL.md plus any
+// sibling files) and lists them in its manifest under `skills`. Other repos
+// install copies into their own `.claude/skills/<name>/`, recorded in their
+// manifest under `installedSkills`.
+
+interface InstalledSkill {
+  from: string;     // provider repo name in the ecosystem
+  version: string | null;
+}
+
+interface PublishedSkill {
+  name: string;
+  version: string | null;
+  description: string | null;
+  dir: string;      // local path of the skill folder
+}
+
+/** Skill names become folder names: no separators, no leading dot. */
+const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function assertSkillName(skill: string): void {
+  if (!SKILL_NAME_RE.test(skill)) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Invalid skill name "${skill}" — use letters, digits, ".", "_" and "-" only`
+    );
+  }
+}
+
+function consumerSkillsRoot(): string {
+  return join(process.cwd(), ".claude", "skills");
+}
+
+function unquote(v: string): string {
+  return v.trim().replace(/^(["'])(.*)\1$/s, "$2");
+}
+
+/**
+ * Pull `description` and `metadata.version` (or a top-level `version`) out of
+ * SKILL.md YAML frontmatter. Deliberately minimal: handles plain scalars and
+ * `>`/`|` block scalars, which is what skill files use.
+ */
+export function parseSkillFrontmatter(content: string): {
+  description: string | null;
+  version: string | null;
+} {
+  const m = content.match(/^﻿?---\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/);
+  if (!m) return { description: null, version: null };
+  const lines = m[1].split(/\r?\n/);
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let description: string | null = null;
+  let topVersion: string | null = null;
+  let metaVersion: string | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (indent(line) !== 0) continue;
+    const kv = line.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+    if (!kv) continue;
+    const [, key, rawValue] = kv;
+    const value = rawValue.trim();
+
+    if (key === "description") {
+      if (/^[>|][+-]?$/.test(value) || value === "") {
+        const block: string[] = [];
+        while (i + 1 < lines.length && (lines[i + 1].trim() === "" || indent(lines[i + 1]) > 0)) {
+          block.push(lines[++i].trim());
+        }
+        description = block.join(value.startsWith("|") ? "\n" : " ").trim() || null;
+      } else {
+        description = unquote(value);
+      }
+    } else if (key === "version") {
+      topVersion = unquote(value) || null;
+    } else if (key === "metadata") {
+      while (i + 1 < lines.length && (lines[i + 1].trim() === "" || indent(lines[i + 1]) > 0)) {
+        const sub = lines[++i].trim().match(/^version\s*:\s*(.+)$/);
+        if (sub) metaVersion = unquote(sub[1]);
+      }
+    }
+  }
+  return { description, version: metaVersion ?? topVersion };
+}
+
+/**
+ * List the skills a repo publishes: folders under `<contextRoot>/skills/`
+ * that contain a SKILL.md. The manifest's `skills.<name>.version` wins over
+ * the frontmatter's `metadata.version`.
+ */
+async function listPublishedSkills(contextRoot: string): Promise<PublishedSkill[]> {
+  const skillsDir = join(contextRoot, "skills");
+  let manifestSkills: Record<string, { version?: unknown; description?: unknown }> = {};
+  const rawManifest = await safeRead(join(contextRoot, "manifest.json"));
+  if (rawManifest) {
+    try {
+      const parsed = JSON.parse(rawManifest);
+      if (parsed?.skills && typeof parsed.skills === "object") manifestSkills = parsed.skills;
+    } catch {
+      // a broken provider manifest still lets the frontmatter speak
+    }
+  }
+
+  let entries;
+  try {
+    entries = await readdir(skillsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: PublishedSkill[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory() || !SKILL_NAME_RE.test(e.name)) continue;
+    const dir = join(skillsDir, e.name);
+    const skillMd = await safeRead(join(dir, "SKILL.md"));
+    if (skillMd === null) continue;
+    const front = parseSkillFrontmatter(skillMd);
+    const fromManifest = manifestSkills[e.name] ?? {};
+    out.push({
+      name: e.name,
+      version:
+        typeof fromManifest.version === "string" ? fromManifest.version : front.version,
+      description:
+        typeof fromManifest.description === "string"
+          ? fromManifest.description
+          : front.description,
+      dir,
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The `.context/` folder of a registered repo that exposes "skills". */
+function providerContextRoot(
+  ecosystem: Ecosystem,
+  repo: string
+): LocalPathResult {
+  const entry = ecosystem.repos[repo];
+  if (!entry) {
+    const available = Object.entries(ecosystem.repos)
+      .filter(([, e]) => e.exposes.includes("skills"))
+      .map(([n]) => n);
+    return {
+      error:
+        `repo "${repo}" is not registered in the ecosystem.` +
+        (available.length > 0 ? ` Repos exposing skills: ${available.join(", ")}.` : ""),
+    };
+  }
+  if (!entry.exposes.includes("skills")) {
+    return {
+      error: `repo "${repo}" does not expose "skills" — its owner must add "skills" to exposes via bridge_register`,
+    };
+  }
+  const root = repoRoot(repo, entry);
+  return "error" in root ? root : { path: join(root.path, ".context") };
+}
+
+/** Relative paths of regular files under `root`. Symlinks are skipped. */
+async function walkFiles(root: string): Promise<string[]> {
+  const out: string[] = [];
+  async function walk(dir: string, prefix: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const sub = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        await walk(join(dir, e.name), sub);
+      } else if (e.isFile()) {
+        out.push(sub);
+      }
+    }
+  }
+  await walk(root, "");
+  return out;
+}
+
+interface CopyReport {
+  added: string[];
+  updated: string[];
+  unchanged: string[];
+  removed: string[];
+}
+
+function emptyReport(): CopyReport {
+  return { added: [], updated: [], unchanged: [], removed: [] };
+}
+
+/**
+ * Copy a skill folder byte for byte (scripts, CRLF and binary files stay
+ * intact; nothing is executed or rewritten). With `prune`, files in `dest`
+ * that no longer exist in `src` are deleted — only for folders the bridge
+ * owns.
+ */
+async function copySkillDir(
+  src: string,
+  dest: string,
+  label: string,
+  prune: boolean,
+  report: CopyReport
+): Promise<void> {
+  const files = await walkFiles(src);
+  const wanted = new Set(files);
+  for (const rel of files) {
+    const srcFile = join(src, rel);
+    const destFile = join(dest, rel);
+    assertSafePath(destFile, [dest]);
+    const newContent = await readFile(srcFile);
+    const oldContent = await readFile(destFile).catch(() => null);
+    const name = `${label}/${rel}`;
+    if (oldContent !== null && oldContent.equals(newContent)) {
+      report.unchanged.push(name);
+      continue;
+    }
+    await mkdir(join(destFile, ".."), { recursive: true });
+    await writeFileAtomic(destFile, newContent);
+    // Keep the executable bit on scripts; drvfs may refuse chmod — harmless.
+    const mode = (await stat(srcFile)).mode & 0o777;
+    if (mode & 0o111) await chmod(destFile, mode).catch(() => {});
+    (oldContent === null ? report.added : report.updated).push(name);
+  }
+  if (!prune) return;
+  for (const rel of await walkFiles(dest)) {
+    if (wanted.has(rel)) continue;
+    await rm(join(dest, rel), { force: true });
+    report.removed.push(`${label}/${rel}`);
+  }
+}
+
+function formatCopyReport(report: CopyReport): string[] {
+  const lines: string[] = [];
+  const section = (title: string, mark: string, items: string[]) => {
+    if (items.length > 0) {
+      lines.push(`${title} (${items.length}):\n${items.map((f) => `  ${mark} ${f}`).join("\n")}`);
+    }
+  };
+  section("Added", "+", report.added);
+  section("Updated", "~", report.updated);
+  section("Removed", "-", report.removed);
+  return lines;
+}
+
+function readInstalledSkills(manifest: Record<string, unknown>): Record<string, InstalledSkill> {
+  const v = manifest.installedSkills;
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, InstalledSkill>)
+    : {};
+}
+
+/**
+ * Changelog lines for skill versions that differ between two manifests, so a
+ * provider's publish shows up in its consumers' bridge_changes.
+ */
+function skillVersionChanges(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>
+): Array<{ skill: string; summary: string }> {
+  const versions = (m: Record<string, unknown>): Record<string, string | null> => {
+    const s = m.skills;
+    if (!s || typeof s !== "object" || Array.isArray(s)) return {};
+    return Object.fromEntries(
+      Object.entries(s as Record<string, { version?: unknown }>).map(([k, v]) => [
+        k,
+        typeof v?.version === "string" ? v.version : null,
+      ])
+    );
+  };
+  const old = versions(before);
+  const cur = versions(after);
+  const out: Array<{ skill: string; summary: string }> = [];
+  for (const [skill, version] of Object.entries(cur)) {
+    if (!(skill in old)) {
+      out.push({ skill, summary: `published ${version ?? "(unversioned)"}` });
+    } else if (old[skill] !== version) {
+      out.push({ skill, summary: `${old[skill] ?? "(unversioned)"} -> ${version ?? "(unversioned)"}` });
+    }
+  }
+  for (const skill of Object.keys(old)) {
+    if (!(skill in cur)) out.push({ skill, summary: "unpublished" });
+  }
+  return out;
+}
+
+async function logSkillChanges(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>
+): Promise<void> {
+  const changes = skillVersionChanges(before, after);
+  if (changes.length === 0) return;
+  const repo = await currentRepoName();
+  for (const { skill, summary } of changes) {
+    await appendChangelog({
+      timestamp: new Date().toISOString(),
+      repo,
+      type: "skill",
+      domain: skill,
+      component: null,
+      summary,
+    });
+  }
+}
+
 // ─── Changelog helpers ────────────────────────────────────────────────────────
 
 export function extractVersion(content: string): string | null {
@@ -606,6 +911,8 @@ const WATCH_CATEGORY_ALIASES: Record<string, ChangelogEntry["type"]> = {
   context: "context",
   manifest: "manifest",
   manifests: "manifest",
+  skill: "skill",
+  skills: "skill",
 };
 
 export function watchMatchesEntry(
@@ -703,6 +1010,21 @@ const DiscoverSchema = z.object({
 
 const ChangesSchema = z.object({
   since: z.string().optional(),
+});
+
+const InstallSkillSchema = z.object({
+  repo: z.string().min(1),
+  skill: z.string().min(1),
+  force: z.boolean().optional(),
+});
+
+const UninstallSkillSchema = z.object({
+  skill: z.string().min(1),
+});
+
+const PublishSkillSchema = z.object({
+  skill: z.string().min(1),
+  version: z.string().min(1).optional(),
 });
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -871,8 +1193,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "bridge_discover",
       description:
         "Discover repos registered in the ecosystem. Call with no args to list " +
-        "all repos and their exposed domains. Pass a name to get details " +
-        "including its manifest. Use the repo name with bridge_get_from to read its files.",
+        "all repos, their exposed domains, and the skills they publish. Pass a name to get details " +
+        "including its manifest and published skills. Use the repo name with bridge_get_from to " +
+        "read its files, or with bridge_install_skill to install one of its skills.",
       inputSchema: {
         type: "object",
         properties: {
@@ -887,9 +1210,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "bridge_changes",
       description:
-        "Show changes from other repos and detect contract version drift. " +
-        "Compares consumed contract versions (pinned by bridge_get_contract) against current versions. " +
-        "Also shows changelog entries filtered by 'watches' in manifest.json (or all contract changes if no watches). " +
+        "Show changes from other repos and detect contract and skill version drift. " +
+        "Compares consumed contract versions (pinned by bridge_get_contract) and installed skill versions " +
+        "(recorded by bridge_install_skill) against what the providers publish now. " +
+        "Also shows changelog entries filtered by 'watches' in manifest.json (or all contract changes, plus " +
+        "updates to installed skills, if no watches). " +
         "Call at session start after bridge_manifest and bridge_discover.",
       inputSchema: {
         type: "object",
@@ -908,9 +1233,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "bridge_sync_skills",
       description:
         "Install or update the companion Claude Code skills (context-reader, " +
-        "context-feeder, context-bridge) into the current repo's .claude/skills/ folder. " +
-        "Run once when onboarding a repo, or after updating the MCP server.",
+        "context-feeder, context-bridge) into the current repo's .claude/skills/ folder, and refresh " +
+        "every skill installed from other repos (manifest installedSkills) from its provider. " +
+        "Run once when onboarding a repo, after updating the MCP server, or when bridge_changes reports skill drift.",
       inputSchema: { type: "object", properties: {}, required: [] },
+    },
+    {
+      name: "bridge_install_skill",
+      description:
+        "Install a skill another ecosystem repo publishes (.context/skills/<skill>/ in that repo) into the " +
+        "current repo's .claude/skills/<skill>/, and record it in manifest installedSkills so " +
+        "bridge_sync_skills keeps it up to date. Files are copied as-is; nothing is executed. " +
+        "Refuses to overwrite a skill folder the bridge did not install unless force is true. " +
+        "Use bridge_discover to see which skills each repo publishes.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "Provider repo name in the ecosystem" },
+          skill: { type: "string", description: "Skill name (folder name under .context/skills/)" },
+          force: {
+            type: "boolean",
+            description: "Overwrite an existing .claude/skills/<skill>/ the bridge did not install",
+          },
+        },
+        required: ["repo", "skill"],
+      },
+    },
+    {
+      name: "bridge_uninstall_skill",
+      description:
+        "Remove a skill installed with bridge_install_skill: deletes .claude/skills/<skill>/ and its " +
+        "manifest installedSkills entry. Refuses skills the bridge did not install.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          skill: { type: "string", description: "Installed skill name" },
+        },
+        required: ["skill"],
+      },
+    },
+    {
+      name: "bridge_publish_skill",
+      description:
+        "Publish (or re-publish after a change) a skill this repo offers to other repos. The skill must " +
+        "live at .context/skills/<skill>/SKILL.md. Records its version and description in manifest skills " +
+        "and logs the version change to the changelog so consumers see it in bridge_changes. " +
+        "The repo must expose \"skills\" in its ecosystem registration.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          skill: { type: "string", description: "Skill folder name under .context/skills/" },
+          version: {
+            type: "string",
+            description:
+              "Version to publish. Defaults to metadata.version in the SKILL.md frontmatter; if both are set they must match.",
+          },
+        },
+        required: ["skill"],
+      },
     },
     {
       name: "bridge_manifest_update",
@@ -1224,6 +1604,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           reachable: "path" in root,
         };
         if ("error" in root) detail.unreachableReason = root.error;
+        if ("path" in root && entry.exposes.includes("skills")) {
+          detail.skills = (await listPublishedSkills(join(root.path, ".context"))).map(
+            ({ name, version, description }) => ({ name, version, description })
+          );
+        }
         if (repoManifest) {
           try {
             detail.manifest = JSON.parse(repoManifest);
@@ -1250,11 +1635,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           ],
         };
       }
-      const lines = repos.map(([n, e]) => {
+      const lines = await Promise.all(repos.map(async ([n, e]) => {
         const reach = repoRoot(n, e);
         const flag = "error" in reach ? "\n    ⚠ unreachable from this environment" : "";
-        return `  - ${n} (${e.stack ?? "unknown stack"})\n    exposes: ${e.exposes.join(", ")}${flag}`;
-      });
+        let skills = "";
+        if ("path" in reach && e.exposes.includes("skills")) {
+          const published = await listPublishedSkills(join(reach.path, ".context"));
+          skills = published
+            .map((sk) => {
+              const desc = sk.description
+                ? ` — ${sk.description.length > 100 ? `${sk.description.slice(0, 97)}...` : sk.description}`
+                : "";
+              return `\n    skill: ${sk.name} ${sk.version ?? "(unversioned)"}${desc}`;
+            })
+            .join("");
+        }
+        return `  - ${n} (${e.stack ?? "unknown stack"})\n    exposes: ${e.exposes.join(", ")}${skills}${flag}`;
+      }));
       return {
         content: [
           { type: "text", text: `Ecosystem repos:\n\n${lines.join("\n\n")}` },
@@ -1314,6 +1711,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         component: null,
         summary: "manifest updated",
       });
+      await logSkillChanges(current, merged);
       return {
         content: [
           {
@@ -1330,6 +1728,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const repoName = await currentRepoName();
       const manifest = await readManifest();
       const watches = manifest.watches as Record<string, string[]> | undefined;
+      const installedSkills = readInstalledSkills(manifest);
       const ecosystem = await readEcosystem();
       const myEntry = ecosystem.repos[repoName];
 
@@ -1351,6 +1750,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (lineCursor !== undefined ? e.line < lineCursor : e.timestamp <= cursor) {
           return false;
         }
+        // Updates to a skill installed here always matter, watches or not
+        if (e.type === "skill" && installedSkills[e.domain]?.from === e.repo) return true;
         if (watches) {
           const watchList = watches[e.repo];
           if (!watchList) return false;
@@ -1410,6 +1811,27 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
       }
 
+      // Installed skills vs. what their providers publish now
+      for (const [skill, inst] of Object.entries(installedSkills)) {
+        const provider = providerContextRoot(ecosystem, inst.from);
+        if ("error" in provider) {
+          driftLines.push(
+            `  ⚠ skill "${skill}": installed v${inst.version ?? "?"} from "${inst.from}", but drift cannot be checked — ${provider.error}`
+          );
+          continue;
+        }
+        const published = (await listPublishedSkills(provider.path)).find((p) => p.name === skill);
+        if (!published) {
+          driftLines.push(
+            `  ⚠ skill "${skill}": installed v${inst.version ?? "?"} from "${inst.from}", but "${inst.from}" no longer publishes it — bridge_uninstall_skill removes the local copy`
+          );
+        } else if (published.version !== inst.version) {
+          driftLines.push(
+            `  ⚠ skill "${skill}": installed v${inst.version ?? "?"} from ${inst.from}, provider now publishes v${published.version ?? "?"} — run bridge_sync_skills to update`
+          );
+        }
+      }
+
       // ── Update cursors — re-read under lock, touch only our own entry ──
       if (myEntry) {
         await updateEcosystem((eco) => {
@@ -1455,7 +1877,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     // ── bridge_sync_skills ────────────────────────────────────────────────
     case "bridge_sync_skills": {
-      const targetRoot = join(process.cwd(), ".claude", "skills");
+      const targetRoot = consumerSkillsRoot();
 
       if (!existsSync(SKILLS_SOURCE)) {
         throw new McpError(
@@ -1464,74 +1886,207 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         );
       }
 
-      // Walk a skill directory and return relative paths of all files
-      async function walkFiles(root: string): Promise<string[]> {
-        const out: string[] = [];
-        async function walk(dir: string, prefix: string): Promise<void> {
-          let entries;
-          try {
-            entries = await readdir(dir, { withFileTypes: true });
-          } catch {
-            return;
-          }
-          for (const e of entries) {
-            const sub = prefix ? `${prefix}/${e.name}` : e.name;
-            if (e.isDirectory()) {
-              await walk(join(dir, e.name), sub);
-            } else if (e.isFile()) {
-              out.push(sub);
-            }
-          }
-        }
-        await walk(root, "");
-        return out;
-      }
+      const report = emptyReport();
+      const notes: string[] = [];
 
-      const added: string[] = [];
-      const updated: string[] = [];
-      const unchanged: string[] = [];
-
+      // 1. The bridge's own companion skills (never pruned: users may keep
+      //    extra notes next to them)
       for (const skill of BRIDGE_SKILLS) {
         const src = join(SKILLS_SOURCE, skill);
         if (!existsSync(src)) continue;
-        const dest = join(targetRoot, skill);
+        await copySkillDir(src, join(targetRoot, skill), skill, false, report);
+      }
 
-        const files = await walkFiles(src);
-        for (const rel of files) {
-          const srcFile = join(src, rel);
-          const destFile = join(dest, rel);
-          const newContent = await readFile(srcFile, "utf-8");
-          const oldContent = await safeRead(destFile);
-          const label = `${skill}/${rel}`;
-
-          if (oldContent === null) {
-            await mkdir(join(destFile, ".."), { recursive: true });
-            await writeFile(destFile, newContent, "utf-8");
-            added.push(label);
-          } else if (oldContent !== newContent) {
-            await writeFile(destFile, newContent, "utf-8");
-            updated.push(label);
-          } else {
-            unchanged.push(label);
+      // 2. Skills installed from other repos — the bridge owns these folders
+      const installed = readInstalledSkills(await readManifest());
+      const newVersions: Record<string, string | null> = {};
+      if (Object.keys(installed).length > 0) {
+        const ecosystem = await readEcosystem();
+        for (const [skill, inst] of Object.entries(installed)) {
+          if (!SKILL_NAME_RE.test(skill)) {
+            notes.push(`⚠ skill "${skill}" skipped — invalid name in manifest installedSkills`);
+            continue;
+          }
+          const provider = providerContextRoot(ecosystem, inst.from);
+          if ("error" in provider) {
+            notes.push(`⚠ skill "${skill}" not refreshed — ${provider.error}`);
+            continue;
+          }
+          const published = (await listPublishedSkills(provider.path)).find((p) => p.name === skill);
+          if (!published) {
+            notes.push(
+              `⚠ skill "${skill}": "${inst.from}" no longer publishes it — kept the local copy; bridge_uninstall_skill removes it`
+            );
+            continue;
+          }
+          await copySkillDir(published.dir, join(targetRoot, skill), skill, true, report);
+          if (published.version !== inst.version) {
+            newVersions[skill] = published.version;
+            notes.push(
+              `skill "${skill}" from ${inst.from}: v${inst.version ?? "?"} -> v${published.version ?? "?"}`
+            );
           }
         }
       }
+      if (Object.keys(newVersions).length > 0) {
+        // Re-read so a concurrent manifest edit isn't lost
+        const manifest = await readManifest();
+        const current = readInstalledSkills(manifest);
+        for (const [skill, version] of Object.entries(newVersions)) {
+          if (current[skill]) current[skill] = { ...current[skill], version };
+        }
+        manifest.installedSkills = current;
+        await writeManifest(manifest);
+      }
 
-      const lines: string[] = [];
-      if (added.length > 0) {
-        lines.push(`Added (${added.length}):\n${added.map((f) => `  + ${f}`).join("\n")}`);
-      }
-      if (updated.length > 0) {
-        lines.push(`Updated (${updated.length}):\n${updated.map((f) => `  ~ ${f}`).join("\n")}`);
-      }
-      if (added.length === 0 && updated.length === 0) {
-        lines.push(`✓ All ${unchanged.length} skill files already up to date.`);
+      const lines = formatCopyReport(report);
+      if (notes.length > 0) lines.push(notes.join("\n"));
+      if (report.added.length + report.updated.length + report.removed.length === 0) {
+        lines.push(`✓ All ${report.unchanged.length} skill files already up to date.`);
       } else {
-        lines.push(`✓ Synced to .claude/skills/ (${unchanged.length} unchanged).`);
+        lines.push(`✓ Synced to .claude/skills/ (${report.unchanged.length} unchanged).`);
       }
 
       return {
         content: [{ type: "text", text: lines.join("\n\n") }],
+      };
+    }
+
+    // ── bridge_install_skill ──────────────────────────────────────────────
+    case "bridge_install_skill": {
+      const { repo, skill, force } = InstallSkillSchema.parse(args);
+      assertSkillName(skill);
+      if (BRIDGE_SKILLS.includes(skill)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `"${skill}" is one of the bridge's own skills — bridge_sync_skills installs it`
+        );
+      }
+      const ecosystem = await readEcosystem();
+      const provider = providerContextRoot(ecosystem, repo);
+      if ("error" in provider) {
+        throw new McpError(ErrorCode.InvalidParams, `Cannot install from ${provider.error}`);
+      }
+      const publishedAll = await listPublishedSkills(provider.path);
+      const published = publishedAll.find((p) => p.name === skill);
+      if (!published) {
+        const names = publishedAll.map((p) => p.name);
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `"${repo}" does not publish a skill named "${skill}".` +
+            (names.length > 0 ? ` It publishes: ${names.join(", ")}.` : " It publishes no skills.")
+        );
+      }
+
+      const targetRoot = consumerSkillsRoot();
+      const dest = join(targetRoot, skill);
+      assertSafePath(dest, [targetRoot]);
+      const previous = readInstalledSkills(await readManifest())[skill];
+      if (existsSync(dest) && !previous && !force) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `.claude/skills/${skill}/ already exists and was not installed by the bridge. ` +
+            "Pass force: true to replace it with the provider's copy."
+        );
+      }
+
+      const report = emptyReport();
+      await copySkillDir(published.dir, dest, skill, true, report);
+
+      const manifest = await readManifest();
+      manifest.installedSkills = {
+        ...readInstalledSkills(manifest),
+        [skill]: { from: repo, version: published.version },
+      };
+      await writeManifest(manifest);
+
+      const verb = previous ? "Reinstalled" : "Installed";
+      const lines = [
+        `✓ ${verb} skill "${skill}" ${published.version ? `v${published.version} ` : ""}from ${repo} into .claude/skills/${skill}/`,
+        ...formatCopyReport(report),
+      ];
+      return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    }
+
+    // ── bridge_uninstall_skill ────────────────────────────────────────────
+    case "bridge_uninstall_skill": {
+      const { skill } = UninstallSkillSchema.parse(args);
+      assertSkillName(skill);
+      const manifest = await readManifest();
+      const installed = readInstalledSkills(manifest);
+      if (!installed[skill]) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Skill "${skill}" was not installed by the bridge (not in manifest installedSkills) — left untouched`
+        );
+      }
+      const targetRoot = consumerSkillsRoot();
+      const dest = join(targetRoot, skill);
+      assertSafePath(dest, [targetRoot]);
+      await rm(dest, { recursive: true, force: true });
+      delete installed[skill];
+      manifest.installedSkills = installed;
+      await writeManifest(manifest);
+      return {
+        content: [
+          { type: "text", text: `✓ Uninstalled skill "${skill}" (removed .claude/skills/${skill}/)` },
+        ],
+      };
+    }
+
+    // ── bridge_publish_skill ──────────────────────────────────────────────
+    case "bridge_publish_skill": {
+      const { skill, version } = PublishSkillSchema.parse(args);
+      assertSkillName(skill);
+      const dir = join(CONTEXT_ROOT, "skills", skill);
+      assertSafePath(dir, [CONTEXT_ROOT]);
+      const skillMd = await safeRead(join(dir, "SKILL.md"));
+      if (skillMd === null) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `No skill at .context/skills/${skill}/SKILL.md — create it there first`
+        );
+      }
+      const front = parseSkillFrontmatter(skillMd);
+      if (version && front.version && version !== front.version) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `version "${version}" does not match metadata.version "${front.version}" in SKILL.md — update one of them`
+        );
+      }
+      const publishVersion = version ?? front.version;
+      if (!publishVersion) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "No version to publish — pass version, or set metadata.version in the SKILL.md frontmatter"
+        );
+      }
+
+      const current = await readManifest();
+      const existing = (current.skills as Record<string, { description?: unknown }> | undefined)?.[skill];
+      const entry: Record<string, unknown> = { version: publishVersion };
+      // Keep a hand-written manifest description; otherwise use the frontmatter's
+      if (typeof existing?.description !== "string" && front.description) {
+        entry.description = front.description;
+      }
+      const next = deepMerge(current, { skills: { [skill]: entry } });
+      await writeManifest(next);
+      await logSkillChanges(current, next);
+
+      const warnings: string[] = [];
+      const repoName = await currentRepoName();
+      const me = (await readEcosystem()).repos[repoName];
+      if (!me) {
+        warnings.push(`⚠ "${repoName}" is not registered in the ecosystem — run bridge_register so other repos can find it`);
+      } else if (!me.exposes.includes("skills")) {
+        warnings.push(`⚠ "${repoName}" does not expose "skills" — re-run bridge_register with "skills" in exposes`);
+      }
+      const changed = skillVersionChanges(current, next).length > 0;
+      const head = changed
+        ? `✓ Published skill "${skill}" v${publishVersion}`
+        : `✓ Skill "${skill}" already published at v${publishVersion} — bump the version so consumers see changes`;
+      return {
+        content: [{ type: "text", text: [head, ...warnings].join("\n") }],
       };
     }
 
