@@ -70,6 +70,23 @@ claude mcp add --scope user --transport stdio context-bridge \
   -- node /mnt/wsl/Ubuntu/home/you/DEV/context-bridge-mcp/dist/index.js
 ```
 
+Use the absolute path to `node` if it comes from nvm — Claude Code started
+from an IDE may not load your shell profile, and plain `node` won't be found.
+
+**Windows**, with the build living in WSL, launches it through `wsl`.
+`/mnt/wsl/...` paths mean nothing to Windows `node`, so don't reuse the
+command above. `wsl.exe` translates the current Windows directory
+(`E:\proj` → `/mnt/e/proj`), so each repo still gets its own `.context/`:
+
+```powershell
+claude mcp add --scope user --transport stdio context-bridge -- `
+  wsl -d Ubuntu -e env ECOSYSTEM_ROOT=/mnt/c/Users/you/.context-bridge `
+  /usr/local/bin/node /home/you/DEV/context-bridge-mcp/dist/index.js
+```
+
+Environment variables go through `env` inside the command, because
+`--env` would set them on the Windows side, where WSL never sees them.
+
 ### C. Embed in a host application (Electron operator gateway, IDE plugin, etc.)
 
 Context Bridge is **not** published to npm — install it directly from this
@@ -429,19 +446,46 @@ When reading, a WSL bridge maps `C:\...` to `/mnt/c/...` and its own distro's
 UNC path back to `/...`; a Windows bridge uses the stored path directly.
 
 **3. For WSL ↔ WSL, expose each distro's filesystem to the others.** Distros
-cannot see each other's files by default. `/mnt/wsl` is shared by all
-distros, so bind-mount each distro's root there — inside that distro's
-`/etc/wsl.conf`:
+cannot see each other's files by default. `/mnt/wsl` is a single mount shared
+by all distros, so bind-mount each distro's root there.
 
-```ini
-[boot]
-command = mkdir -p /mnt/wsl/Ubuntu-24.04 && mount --bind / /mnt/wsl/Ubuntu-24.04
+A one-shot `[boot] command` in `wsl.conf` is **not enough**: when *another*
+distro shuts down, its systemd unmounts everything under `/mnt/wsl` —
+including your mount — while your distro keeps running. Use a small systemd
+service that re-creates the mount whenever it disappears. Inside each distro
+(requires `systemd=true` in `/etc/wsl.conf`), as root, replacing `Ubuntu`
+with that distro's name:
+
+```bash
+cat > /usr/local/sbin/wsl-distro-bind <<'EOF'
+#!/bin/bash
+M=/mnt/wsl/Ubuntu
+while true; do
+  mountpoint -q "$M" || { mkdir -p "$M" && mount --bind / "$M"; }
+  findmnt --poll=umount --first-only --timeout 60000 >/dev/null 2>&1 || true
+done
+EOF
+chmod 755 /usr/local/sbin/wsl-distro-bind
+
+cat > /etc/systemd/system/wsl-distro-bind.service <<'EOF'
+[Unit]
+Description=Bind-mount this WSL distro under /mnt/wsl for other distros
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/sbin/wsl-distro-bind
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now wsl-distro-bind
 ```
 
-(use the distro's own name; takes effect after `wsl --shutdown`). A bridge in
-`Ubuntu` then reads `\\wsl.localhost\Ubuntu-24.04\...` via
-`/mnt/wsl/Ubuntu-24.04/...`. If the mount is missing, tools say so and print
-the command to run instead of failing silently.
+A bridge in `Ubuntu-24.04` then reads `\\wsl.localhost\Ubuntu\...` via
+`/mnt/wsl/Ubuntu/...`. The distro holding the files must be running; if the
+mount is missing, tools say so instead of failing silently.
 
 **Notes:**
 

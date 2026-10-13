@@ -464,9 +464,10 @@ function foreignDistroHint(stored: string, env: PathEnv): string {
   }
   const mountPoint = posix.join(env.wslDistrosRoot, parsed.distro);
   return (
-    ` It lives in WSL distro "${parsed.distro}". Expose that distro's filesystem by running, ` +
-    `inside "${parsed.distro}": sudo mkdir -p ${mountPoint} && sudo mount --bind / ${mountPoint} ` +
-    "(add it to that distro's /etc/wsl.conf [boot] command to survive restarts)."
+    ` It lives in WSL distro "${parsed.distro}" — make sure it is running, then expose its ` +
+    `filesystem by running inside "${parsed.distro}": sudo mkdir -p ${mountPoint} && ` +
+    `sudo mount --bind / ${mountPoint}. To keep it mounted permanently, install the ` +
+    "wsl-distro-bind service from the README (a wsl.conf boot command is not enough)."
   );
 }
 
