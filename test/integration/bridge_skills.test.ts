@@ -140,7 +140,10 @@ describe("published skills", () => {
       readFileSync(join(providerSkill, "bin", "run.cmd"))
     );
     expect(readFileSync(join(dest, "icon.bin"))).toEqual(Buffer.from([0, 255, 13, 10, 128]));
-    expect(statSync(join(dest, "bin", "run.sh")).mode & 0o111).not.toBe(0);
+    if (process.platform !== "win32") {
+      // Windows has no executable bit to preserve
+      expect(statSync(join(dest, "bin", "run.sh")).mode & 0o111).not.toBe(0);
+    }
 
     expect(consumerManifest().installedSkills).toEqual({
       "asset-library": { from: PROVIDER, version: "1.0.0" },

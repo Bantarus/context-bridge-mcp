@@ -34,7 +34,10 @@ function writeFileDeep(path: string, content: string) {
   writeFileSync(path, content, "utf-8");
 }
 
-describe("cross-environment (bridge running inside WSL)", () => {
+// WSL mode keys off WSL_DISTRO_NAME on a non-Windows platform; a Windows
+// node process never enters it, so this simulation only runs elsewhere.
+// Path translation itself is unit-tested on every OS (crossEnvPaths.test.ts).
+describe.skipIf(process.platform === "win32")("cross-environment (bridge running inside WSL)", () => {
   let bridge: BridgeHandle;
   let fakeMounts: string;
   let drivesRoot: string;
