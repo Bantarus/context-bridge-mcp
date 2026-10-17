@@ -59,6 +59,11 @@ in irrelevant context.
 `bridge_get_contract` searches the local repo first, then all ecosystem repos
 that expose `contracts`. No need to know which repo owns the contract.
 
+Other repos are reached by name only. The bridge shows their locations as
+`<repo:name>`. Never look for another repo's files with your own file tools
+or by reading `ecosystem.json`. If the bridge can't give you what you need,
+ask the user.
+
 Every call to `bridge_get_contract` automatically pins the consumed version.
 When `bridge_changes` runs, it compares pinned versions against current versions
 and reports drift. This is why contracts **must** have a `## Version` section.

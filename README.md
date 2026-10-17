@@ -468,6 +468,29 @@ install unless you pass `force: true`, and never uninstalls one.
 
 ---
 
+## Repo paths stay hidden
+
+Agents reach other repos by **name**, and the bridge resolves the location
+itself. It never tells an agent where another repo lives on disk, so the
+agent has no path to hand to its own file tools to skip the bridge. Every
+tool response and error goes through a filter that replaces each registered
+repo's path, in any notation (`E:\...`, `/mnt/e/...`,
+`\\wsl.localhost\...`, `/mnt/wsl/<Distro>/...`, JSON-escaped), with
+`<repo:name>`. The `ECOSYSTEM_ROOT` location is replaced too, because
+`ecosystem.json` lists every path. The current repo's own path is left as is.
+
+Documents are the exception. Context files, contracts, manifests and skills
+are returned exactly as their owner wrote them. If a provider's contract
+gives consumers an absolute path to run its CLI, that path is the
+provider's choice and comes through.
+
+This removes the pointers, but it isn't a sandbox. An agent with
+unrestricted `Read`/`Bash` can still open `ecosystem.json` or search the
+disks. To actually confine it, use Claude Code's permission deny rules and
+sandbox mode as well.
+
+---
+
 ## WSL + Windows cross-environment usage
 
 One ecosystem can span the Windows host and any number of WSL2 distros. Each

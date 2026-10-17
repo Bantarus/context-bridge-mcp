@@ -107,6 +107,9 @@ bridge_get_from("<repo-name>", "<domain>", "<component>")
 
 Pass the ecosystem repo name (from `bridge_discover`). The server resolves
 the path internally — you never need to know where the repo lives on disk.
+The bridge shows other repos' locations as `<repo:name>`. Don't try to find
+them with file tools, read `ecosystem.json`, or search the disks: go
+through the bridge tools.
 
 Use only when debugging a cross-repo mismatch or implementing something
 that requires understanding the other side's internals.

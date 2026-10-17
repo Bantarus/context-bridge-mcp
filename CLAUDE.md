@@ -61,6 +61,8 @@ The entire server is a single file: `src/index.ts`. It uses the `@modelcontextpr
 
 `assertSafePath()` validates that all resolved file paths stay within allowed roots (`CONTEXT_ROOT`, `CONTRACTS_ROOT`, or an explicit external root for `bridge_get_from`) to prevent path traversal. It rejects `..` escapes and cross-drive (absolute) relatives. Every tool that takes a `domain`/`component` must call it — including listing tools.
 
+**No path leaks:** tool output must never reveal another registered repo's absolute path (an agent could use it to bypass the bridge with its own file tools). The `CallToolRequestSchema` handler wraps `handleToolCall()` and runs every response block and every error message through `buildPathRedactor()`, which replaces each registered repo's path (stored and local notations, either slash direction, case-insensitive, JSON-escaped) with `<repo:name>` and `ECOSYSTEM_ROOT` with `<ECOSYSTEM_ROOT>`; the current repo's own path is exempt. Blocks that carry a repo's own document (context file, contract, manifest, `bridge_discover` detail) are marked `verbatim: true` and pass through unchanged — redact any bridge-generated field inside them explicitly. Don't put paths in bridge messages in the first place: errors from `toLocalPath()` / `resolveStoredDir()` say *why* a repo is unreachable, not where it is.
+
 ### Deep merge
 
 `bridge_manifest_update` uses a custom `deepMerge()` that recursively merges objects but replaces arrays wholesale (does not concatenate them).

@@ -97,7 +97,7 @@ async function readEcosystem(): Promise<Ecosystem> {
   } catch {
     throw new McpError(
       ErrorCode.InternalError,
-      `ecosystem.json is malformed (${ECOSYSTEM_PATH}) — fix or delete the file`
+      "ecosystem.json in ECOSYSTEM_ROOT is malformed — fix or delete the file"
     );
   }
 }
@@ -141,7 +141,7 @@ async function withEcosystemLock<T>(fn: () => Promise<T>): Promise<T> {
       if (Date.now() > deadline) {
         throw new McpError(
           ErrorCode.InternalError,
-          `Timed out waiting for ${ECOSYSTEM_LOCK_PATH} — delete it if no other bridge process is running`
+          "Timed out waiting for ecosystem.lock in ECOSYSTEM_ROOT — delete it if no other bridge process is running"
         );
       }
       await sleep(20 + Math.random() * 30);
@@ -413,7 +413,7 @@ export type LocalPathResult = { path: string } | { error: string };
  */
 export function toLocalPath(stored: string, env: PathEnv = currentPathEnv()): LocalPathResult {
   const parsed = parseAnyPath(stored);
-  if (!parsed) return { error: `stored path "${stored}" is not absolute` };
+  if (!parsed) return { error: "its stored path is not absolute" };
 
   if (env.platform === "win32") {
     if (parsed.kind === "posix") {
@@ -423,7 +423,7 @@ export function toLocalPath(stored: string, env: PathEnv = currentPathEnv()): Lo
       }
       return {
         error:
-          `"${stored}" is a Linux path registered by an older bridge version and the WSL distro it ` +
+          "it has a Linux path registered by an older bridge version and the WSL distro it " +
           "belongs to is unknown. Re-run bridge_register for this repo from inside WSL.",
       };
     }
@@ -444,12 +444,12 @@ export function toLocalPath(stored: string, env: PathEnv = currentPathEnv()): Lo
         }
         return { path: posix.join(env.wslDistrosRoot, parsed.distro, ...parsed.segs) };
       case "unc":
-        return { error: `network path "${stored}" is not reachable from WSL — mount it first` };
+        return { error: "it lives on a network path that is not reachable from WSL — mount it first" };
     }
   }
 
   if (parsed.kind === "posix") return { path: formatParsed(parsed) };
-  return { error: `Windows path "${stored}" is not reachable from ${env.platform}` };
+  return { error: `it lives on a Windows path, which is not reachable from ${env.platform}` };
 }
 
 /** Explain how to make another distro's files visible, for error messages. */
@@ -482,7 +482,7 @@ function resolveStoredDir(stored: string, label: string): LocalPathResult {
   if ("error" in local) return { error: `${label}: ${local.error}` };
   if (!existsSync(local.path)) {
     return {
-      error: `${label}: not found at ${local.path} from this environment.${foreignDistroHint(stored, env)}`,
+      error: `${label}: not found from this environment.${foreignDistroHint(stored, env)}`,
     };
   }
   return local;
@@ -816,6 +816,74 @@ async function logSkillChanges(
       summary,
     });
   }
+}
+
+// ─── Path redaction ───────────────────────────────────────────────────────────
+//
+// Tool output must never reveal where another repo lives on disk: an agent
+// that learns the path can read that repo with its own file tools instead of
+// going through the bridge. Every tool response and error passes through
+// this redactor, which replaces each registered repo's location (in every
+// notation this process might print it) with a placeholder naming the repo.
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** All the spellings under which `p` could show up in output. */
+function pathSpellings(p: string): string[] {
+  const out = new Set<string>();
+  for (const base of [p, p.replace(/\\/g, "/"), p.replace(/\//g, "\\")]) {
+    const trimmed = base.replace(/[\\/]+$/, "");
+    if (trimmed.length < 2) continue;  // never redact "/" or "C:"
+    out.add(trimmed);
+    out.add(JSON.stringify(trimmed).slice(1, -1));  // as it appears inside JSON
+  }
+  return [...out];
+}
+
+export function buildPathRedactor(
+  ecosystem: Ecosystem,
+  env: PathEnv = currentPathEnv(),
+  ownRepoRoot: string = resolve(CONTEXT_ROOT, "..")
+): (text: string) => string {
+  const rules: Array<{ spelling: string; label: string }> = [];
+  const add = (p: string | undefined, label: string) => {
+    if (!p) return;
+    for (const spelling of pathSpellings(p)) rules.push({ spelling, label });
+  };
+
+  for (const [name, entry] of Object.entries(ecosystem.repos)) {
+    const local = toLocalPath(entry.path, env);
+    // The current repo's own path is no secret to an agent working in it
+    if ("path" in local && resolve(local.path) === ownRepoRoot) continue;
+    const label = `<repo:${name}>`;
+    for (const stored of [entry.path, entry.contractsPath]) {
+      if (!stored) continue;
+      add(stored, label);
+      const l = toLocalPath(stored, env);
+      if ("path" in l) add(l.path, label);
+    }
+  }
+  // ecosystem.json lists every repo's path
+  add(ECOSYSTEM_ROOT, "<ECOSYSTEM_ROOT>");
+  if (rules.length === 0) return (t) => t;
+
+  // Longest first, so a repo nested in another is labelled by itself
+  rules.sort((a, b) => b.spelling.length - a.spelling.length);
+  const labelFor = new Map<string, string>();
+  for (const r of rules) {
+    const key = r.spelling.toLowerCase();
+    if (!labelFor.has(key)) labelFor.set(key, r.label);
+  }
+  // Case-insensitive (drive letters, Windows paths); only whole path
+  // segments, so /srv/app never matches inside /srv/app2. A following "."
+  // counts as a boundary so sentence-final paths are caught too.
+  const pattern = new RegExp(
+    `(?:${[...labelFor.keys()].map(escapeRegExp).join("|")})(?![^\\s\\\\/"'\`.,;:)\\]}>])`,
+    "gi"
+  );
+  return (text) => text.replace(pattern, (m) => labelFor.get(m.toLowerCase()) ?? m);
 }
 
 // ─── Changelog helpers ────────────────────────────────────────────────────────
@@ -1315,7 +1383,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // ── Call tools ────────────────────────────────────────────────────────────────
 
+interface ToolCall {
+  params: { name: string; arguments?: Record<string, unknown> };
+}
+
+interface ToolResult {
+  /**
+   * `verbatim` marks a repo's own document (context file, contract,
+   * manifest), passed through exactly as its owner wrote it — what a
+   * document reveals is the owner's choice. Everything else is a bridge
+   * message and is redacted.
+   */
+  content: Array<{ type: "text"; text: string; verbatim?: boolean }>;
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  let redact: (text: string) => string;
+  try {
+    redact = buildPathRedactor(await readEcosystem());
+  } catch {
+    redact = buildPathRedactor({ version: "1.0", repos: {} });
+  }
+  try {
+    const result = await handleToolCall(req, redact);
+    return {
+      ...result,
+      content: result.content.map(({ verbatim, ...c }) => ({
+        ...c,
+        text: verbatim ? c.text : redact(c.text),
+      })),
+    };
+  } catch (err) {
+    if (err instanceof McpError) {
+      // McpError prefixes its message with "MCP error <code>: " — strip it so
+      // the SDK doesn't add the prefix twice when it serializes.
+      const message = err.message.replace(/^MCP error -?\d+: /, "");
+      throw new McpError(err.code, redact(message), err.data);
+    }
+    // fs errors carry the full path ("ENOENT: ..., open '/x/y'")
+    throw new McpError(
+      ErrorCode.InternalError,
+      redact(err instanceof Error ? err.message : String(err))
+    );
+  }
+});
+
+async function handleToolCall(
+  req: ToolCall,
+  redact: (text: string) => string
+): Promise<ToolResult> {
   const { name, arguments: args } = req.params;
 
   switch (name) {
@@ -1327,6 +1443,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           {
             type: "text",
             text: JSON.stringify(manifest, null, 2),
+            verbatim: true,
           },
         ],
       };
@@ -1346,7 +1463,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             `No file found: .context/${domain}/${component}.md — use bridge_list to discover what exists`
           );
         }
-        return { content: [{ type: "text", text: content }] };
+        return { content: [{ type: "text", text: content, verbatim: true }] };
       }
 
       // No component — list the domain directory
@@ -1445,7 +1562,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             `No file found: ${repo}/.context/${domain}/${component}.md`
           );
         }
-        return { content: [{ type: "text", text: content }] };
+        return { content: [{ type: "text", text: content, verbatim: true }] };
       }
 
       const keys = await listMdFiles(path);
@@ -1472,7 +1589,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const localContent = await safeRead(localPath);
       if (localContent) {
         await trackConsumedVersion(domain, localContent, "local");
-        return { content: [{ type: "text", text: localContent }] };
+        return { content: [{ type: "text", text: localContent, verbatim: true }] };
       }
 
       // 2. Search ecosystem repos that expose "contracts"
@@ -1491,7 +1608,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           return {
             content: [
               { type: "text", text: `✓ Resolved from ecosystem repo: ${repoName}` },
-              { type: "text", text: repoContent },
+              { type: "text", text: repoContent, verbatim: true },
             ],
           };
         }
@@ -1603,7 +1720,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           registeredAt: entry.registeredAt,
           reachable: "path" in root,
         };
-        if ("error" in root) detail.unreachableReason = root.error;
+        // This block carries the repo's own manifest and skill descriptions
+        // verbatim, so redact the bridge's own field here
+        if ("error" in root) detail.unreachableReason = redact(root.error);
         if ("path" in root && entry.exposes.includes("skills")) {
           detail.skills = (await listPublishedSkills(join(root.path, ".context"))).map(
             ({ name, version, description }) => ({ name, version, description })
@@ -1618,7 +1737,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         return {
           content: [
-            { type: "text", text: JSON.stringify(detail, null, 2) },
+            { type: "text", text: JSON.stringify(detail, null, 2), verbatim: true },
           ],
         };
       }
@@ -2093,7 +2212,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     default:
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
   }
-});
+}
 
 // ─── Deep merge util ──────────────────────────────────────────────────────────
 
