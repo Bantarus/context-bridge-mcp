@@ -143,10 +143,10 @@ describe("feedback 2026-11: registration, versions, messages", () => {
     ).rejects.toThrow(/No contract at contracts\/nope\.md/);
   });
 
-  // ── 6. Messages between repos ──
+  // ── 6. Messages between repos (now on the bus; bridge_send_message is an alias) ──
 
-  it("delivers a message to the addressee's bridge_changes, whatever its watches", async () => {
-    // voicy watches nothing from vessel
+  it("delivers a message through the bus and keeps it listed until it is read", async () => {
+    // voicy watches nothing from vessel: direct messages show regardless
     await call(voicy, "bridge_manifest_update", { patch: { watches: { other: ["contracts"] } } });
     await call(voicy, "bridge_changes"); // move voicy's cursor
 
@@ -156,33 +156,53 @@ describe("feedback 2026-11: registration, versions, messages", () => {
       content: "Use `vessel recall --from <path>`.",
       inReplyTo: "voicy/requests/2026-11-19-to-vessel-shard",
     });
-    const component = sent.match(/requests\/([^\s]+)\.md/)![1];
-    expect(component).toMatch(/^\d{4}-\d{2}-\d{2}-to-voicy-re-reading-the-llm-lite-shard$/);
-    expect(sent).toContain(`Added "requests" to vessel's exposed domains.`);
+    const id = sent.match(/Sent (m-[0-9a-z]+) to voicy/)![1];
+    expect(sent).toContain("deprecated");
 
-    const file = readFileSync(join(vesselDir, ".context", "requests", `${component}.md`), "utf-8");
-    expect(file).toContain("- From: vessel\n- To: voicy\n");
-    expect(file).toContain("- In reply to: voicy/requests/2026-11-19-to-vessel-shard");
-    const manifest = JSON.parse(readFileSync(join(vesselDir, ".context", "manifest.json"), "utf-8"));
-    expect(manifest.domains.requests).toEqual([component]);
+    // Nothing written into the sender's repo, nothing exposed without asking
+    expect(() => readFileSync(join(vesselDir, ".context", "requests", "x.md"))).toThrow();
+    const eco1 = JSON.parse(readFileSync(join(eco, "ecosystem.json"), "utf-8"));
+    expect(eco1.repos.vessel.exposes).not.toContain("requests");
 
     const changes = await call(voicy, "bridge_changes");
-    expect(changes).toContain("Messages for you (1)");
-    expect(changes).toContain(`from vessel: "Re: reading the llm-lite shard"`);
-    expect(changes).toContain(`bridge_get_from("vessel", "requests", "${component}")`);
+    expect(changes).toContain("Messages for you (1 open)");
+    expect(changes).toContain(`[${id}] note from vessel: "Re: reading the llm-lite shard"`);
+    // Listing doesn't consume it
+    expect(await call(voicy, "bridge_changes")).toContain(`[${id}]`);
 
-    const read = await call(voicy, "bridge_get_from", { repo: "vessel", domain: "requests", component });
+    const read = await call(voicy, "bridge_inbox", { id });
     expect(read).toContain("vessel recall --from");
-
-    // Seen once: the cursor moved past it
+    expect(read).toContain("In reply to: voicy/requests/2026-11-19-to-vessel-shard");
+    // A note is done once read
     expect(await call(voicy, "bridge_changes")).not.toContain("Messages for you");
   });
 
-  it("a second message with the same subject gets its own file", async () => {
-    const a = await call(vessel, "bridge_send_message", { to: "voicy", subject: "Same", content: "1" });
-    const b = await call(vessel, "bridge_send_message", { to: "voicy", subject: "Same", content: "2" });
-    expect(a).not.toBe(b);
-    expect(b).toMatch(/-to-voicy-same-2\.md/);
+  it("an old-style message in changelog.jsonl shows up in the new inbox", async () => {
+    mkdirSync(join(vesselDir, ".context", "requests"), { recursive: true });
+    writeFileSync(join(vesselDir, ".context", "requests", "2026-11-18-to-voicy-old.md"), "# Old\n\nFrom the old bridge.\n");
+    appendFileSync(
+      join(eco, "changelog.jsonl"),
+      JSON.stringify({
+        timestamp: "2026-11-18T10:00:00.000Z",
+        repo: "vessel",
+        type: "message",
+        domain: "requests",
+        component: "2026-11-18-to-voicy-old",
+        summary: "Old",
+        to: "voicy",
+      }) + "\n"
+    );
+    const inbox = await call(voicy, "bridge_inbox");
+    const id = inbox.match(/\[(legacy-\d+)\] note from vessel: "Old" \[old-style message\]/)![1];
+    expect(await call(voicy, "bridge_inbox", { id })).toContain("From the old bridge.");
+  });
+
+  it("refuses the same message twice", async () => {
+    await call(vessel, "bridge_send_message", { to: "voicy", subject: "Same", content: "1" });
+    await expect(
+      vessel.client.callTool({ name: "bridge_send_message", arguments: { to: "voicy", subject: "Same", content: "1" } })
+    ).rejects.toThrow(/Duplicate/);
+    expect(await call(vessel, "bridge_send_message", { to: "voicy", subject: "Same", content: "2" })).toMatch(/Sent m-/);
   });
 
   it("refuses unknown addressees and unregistered senders", async () => {
@@ -198,7 +218,7 @@ describe("feedback 2026-11: registration, versions, messages", () => {
     try {
       await expect(
         b.client.callTool({ name: "bridge_send_message", arguments: { to: "voicy", subject: "x", content: "x" } })
-      ).rejects.toThrow(/"loose"\) is not registered/);
+      ).rejects.toThrow(/not registered in the ecosystem, so it can't send or receive messages/);
     } finally {
       await b.close();
       rmSync(loose, { recursive: true, force: true });

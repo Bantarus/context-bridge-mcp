@@ -72,7 +72,12 @@ discover it via `bridge_discover`.
 If you edit `contracts/<domain>.md` directly instead of through
 `bridge_update_contract`, bump `## Version`, add a dated line at the top of
 `## Changelog`, then call `bridge_publish_contract("<domain>")`. Consumers see
-`1.9 -> 1.10: <that line>` in `bridge_changes`.
+`1.9 -> 1.10: <that line>` in `bridge_changes`. Every logged contract,
+skill, context or manifest change is also the automatic topic
+`<repo>/contracts/<domain>` (or `skills/`, `context/`, `manifest`) that
+other repos subscribe to; there is nothing extra to publish. If the user
+asks you to tell dependants directly, use
+`bridge_send({ to: [...], subject, content, intent: "request" })`.
 
 **Rule 8 — Republish skills you change.**
 If this repo publishes skills (`.context/skills/<name>/SKILL.md`, listed under

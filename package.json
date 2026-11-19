@@ -1,7 +1,7 @@
 {
   "name": "context-bridge-mcp",
   "version": "1.0.0",
-  "description": "Context Bridge MCP — project-agnostic shared context layer for multi-repo projects",
+  "description": "Context Bridge MCP \u2014 project-agnostic shared context layer for multi-repo projects",
   "license": "MIT",
   "author": "Bantarus",
   "repository": {
@@ -15,7 +15,8 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "context-bridge-mcp": "dist/index.js"
+    "context-bridge-mcp": "dist/index.js",
+    "beam": "dist/beam.js"
   },
   "files": [
     "dist",

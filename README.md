@@ -150,7 +150,11 @@ another repo and reads its `.context/` folder.
 | `bridge_install_skill` | Install a skill another repo publishes into `.claude/skills/` |
 | `bridge_uninstall_skill` | Remove a skill installed with `bridge_install_skill` |
 | `bridge_publish_skill` | Publish (or re-publish) a skill from `.context/skills/<name>/` |
-| `bridge_send_message` | Send feedback, a request or a reply to another repo |
+| `bridge_inbox` | This repo's messages: open items, requests it waits on, topic posts; read one (`id`) or a thread |
+| `bridge_send` | Message other repos, post on a topic, or reply to a message |
+| `bridge_ack` | Mark a received message accepted, done or declined (the sender gets a receipt) |
+| `bridge_subscribe` | List, add or remove topic subscriptions |
+| `bridge_send_message` | Deprecated alias of `bridge_send` |
 | `bridge_manifest_update` | Deep-merge a patch into manifest.json |
 
 ---
@@ -299,8 +303,11 @@ bridge_get("routes", "users")  ← fetch the context I need
 bridge_get_contract("users")   ← resolved automatically from ecosystem
 ```
 
-`bridge_changes` is filtered by `watches` in your manifest. If you declare
-watches, you only see changes from the repos and domains you care about:
+`bridge_changes` is filtered by your subscriptions: topic patterns such as
+`my-api/contracts/*` in the manifest's `subscriptions` (edit them with
+`bridge_subscribe` or `beam subscribe add <topic>`), plus the older `watches`,
+which keep working and count as subscriptions. With watches you only see
+changes from the repos and domains you care about:
 
 ```json
 {
@@ -324,8 +331,9 @@ Each watch token matches in two ways:
 The example above subscribes to *all* of `my-api`'s contracts plus changes
 in its `schemas` domain, and to anything in `shared-lib`'s `events` domain.
 
-If no watches are declared, `bridge_changes` shows all contract changes from
-other repos as a safe default.
+If neither `watches` nor `subscriptions` is declared, `bridge_changes` shows
+all contract changes from other repos as a safe default. Updates to skills
+installed from other repos always show.
 
 `bridge_get_contract` is ecosystem-aware: it searches the current repo first,
 then all ecosystem repos that expose `contracts`. No need to know which repo
@@ -411,26 +419,76 @@ of resending the whole file through `bridge_update_contract`.
 
 ### Messages between repos
 
-Feedback, requests and replies between projects go through one convention:
+Repos talk to each other through a **bus**: a folder next to `ecosystem.json`
+(`<ECOSYSTEM_ROOT>/bus/`) that every Windows and WSL bridge shares. It is
+used on demand — when you tell an agent to check its messages or send one, or
+when you run `beam` yourself. Nothing is pushed into a session, and the bridge
+doesn't decide what anyone does with a message.
 
 ```
-bridge_send_message({ to: "vessel", subject: "Reading another project's shard", content: "..." })
+bridge_send({ to: "vessel", subject: "Reading another project's shard", content: "...", intent: "question" })
+bridge_inbox()                       ← open items, requests you wait on, new topic posts
+bridge_inbox({ id: "m-4k2..." })     ← read one in full
+bridge_send({ replyTo: "m-4k2...", content: "..." })
+bridge_ack({ id: "m-4k2...", status: "done" })
 ```
 
-- The message is written to **the sender's** `.context/requests/` as
-  `<date>-to-<repo>-<subject>.md`. The file starts with the subject as its
-  title, followed by `From`, `To`, `Date` and optionally `In reply to`.
-- The sender's `requests` domain is listed in its manifest and added to its
-  exposed domains, so other repos can read it.
-- The addressee sees it at the top of `bridge_changes`, under
-  **Messages for you**, whatever its `watches` say. It reads the message
-  with `bridge_get_from("<sender>", "requests", "<file>")`.
-- To reply, call `bridge_send_message` back, with
-  `inReplyTo: "<repo>/requests/<file>"`.
+- **Mailbox = repo.** Only registered repos can send or receive; identity is
+  the registered entry whose path is the current repo.
+- **Intent** says what the sender expects: `note` (done once read),
+  `question` (answered by a reply), `request` (`accepted`, then `done`, or
+  `declined`). The sender sees each step as a receipt under "Waiting on
+  others". `priority` only sorts listings; `expiresIn` is advisory.
+- **Items stay open until closed.** Listing (`bridge_inbox`,
+  `bridge_changes`'s "Messages for you") never consumes them.
+- **Topics.** Contract, skill, context and manifest changes are automatic
+  topics (`<repo>/contracts/<domain>`, ...) shown by `bridge_changes`. A repo
+  can declare its own in its manifest, and subscribers see posts in
+  `bridge_inbox`:
 
-Both repos must be registered. Use `requests` for these messages; don't
-create separate `feedback/`, `responses/` or `proposals/` folders, because
-nothing in them reaches the addressee.
+  ```json
+  {
+    "topics": { "releases": { "description": "Release notes", "post": "owner" } },
+    "subscriptions": ["vessel/releases", "*/skills/*"],
+    "messaging": { "block": ["noisy-repo"] }
+  }
+  ```
+
+  `post` is `owner` (default), `subscribers` or `any`. `ecosystem/announce`
+  is open to every registered repo and reaches everyone.
+- **Limits that protect the shared folder:** subject 120 characters, body
+  32 KB, identical re-sends refused, and at most 500 messages per repo per
+  hour (`maxPerHour` in `<ECOSYSTEM_ROOT>/bus/policy.json`).
+- **Message bodies are another repo's text.** They are shown inside a
+  `<bridge-message>` block, with other repos' paths redacted like all bridge
+  output.
+- Old messages from `bridge_send_message` before the bus (in
+  `.context/requests/`) still show up in the inbox, marked old-style.
+  `bridge_send_message` itself now sends through the bus and is deprecated.
+
+### The `beam` CLI
+
+The same operations, for your own terminal (or an agent's shell). `beam`
+acts for the nearest folder with a `.context/` at or above the current
+directory, or `--repo <path>`, and honours `ECOSYSTEM_ROOT` and
+`CONTEXT_ROOT`.
+
+```
+beam inbox [--show open|all|sent] [--limit N]
+beam read <id>
+beam thread <id>
+beam send --to <repo>[,<repo>] --subject "..." [--intent note|question|request] [--priority high] -m "..."
+beam send --reply <id> -m "..."           # or --file body.md, or pipe the body on stdin
+beam send --topic <owner>/<name> --subject "..." -m "..."
+beam ack <id> accepted|declined|done [--note "..."]
+beam subscribe [list] | add <topic> | remove <topic>
+beam help [command]
+```
+
+`--json` prints the structured result. Exit codes: `0` done, `1` refused or
+not found (reason on stderr), `2` usage error. `context-bridge-mcp <command>`
+does the same; with no arguments it still starts the MCP server. After
+`npm install -g` (or `npm link` in a checkout), `beam` is on the PATH.
 
 ### Sharing skills between repos
 

@@ -98,15 +98,46 @@ bridge_register({
 })
 ```
 
-### Rule 6 — Talk to other repos with messages
+### Rule 6 — Messages and topics: the bus tools
 
-To give feedback, ask for something, or reply to another repo, use
-`bridge_send_message({ to: "<repo>", subject, content, inReplyTo? })`. It
-writes to this repo's `.context/requests/` and the addressee gets it under
-**Messages for you** in `bridge_changes`. Read messages with the
-`bridge_get_from("<sender>", "requests", "<file>")` call that
-`bridge_changes` shows. Never write feedback into ad-hoc folders such as
-`feedback/` or `responses/`, because the addressee never sees them.
+Repos exchange messages through a shared bus next to the ecosystem registry.
+Use these when the user asks you to check messages, send one, or answer one.
+The same operations exist as the `beam` CLI for the user's own shell.
+
+| Tool | CLI | Use |
+|---|---|---|
+| `bridge_inbox()` | `beam inbox` | Open items for this repo, requests it waits on, new topic posts. `show: "all"` adds closed items, `show: "sent"` lists what this repo sent |
+| `bridge_inbox({ id })` | `beam read <id>` | Read one message in full. Marks it seen; the sender gets a `read` receipt |
+| `bridge_inbox({ thread: id })` | `beam thread <id>` | A whole conversation, oldest first |
+| `bridge_send({ to, subject, content, intent?, priority?, expiresIn?, template? })` | `beam send --to <repo> --subject "..." -m "..."` | Message one or more repos (`to` takes a name or a list) |
+| `bridge_send({ replyTo: id, content })` | `beam send --reply <id> -m "..."` | Answer a message: same thread, recipients and `Re:` subject filled in |
+| `bridge_send({ topic: "<owner>/<name>", subject, content })` | `beam send --topic <owner/name> ...` | Post on a topic the owner declared (`ecosystem/announce` is open to every repo) |
+| `bridge_ack({ id, status, note? })` | `beam ack <id> accepted\|declined\|done` | Close or progress an item; the sender sees a receipt |
+| `bridge_subscribe({ action, topic })` | `beam subscribe add <topic>` | List, add or remove topic subscriptions; `list` also shows topics other repos offer |
+
+What the fields mean:
+
+- `intent` records what the sender expects: `note` (nothing; done once read),
+  `question` (a reply; answering with `replyTo` closes it), `request` (work:
+  `accepted`, then `done`, or `declined`). `priority` (`low`/`normal`/`high`)
+  only sorts listings; `expiresIn` (`"3d"`) is advisory.
+- Ids can be shortened to any unambiguous prefix.
+- Items stay open until acknowledged; listing never consumes them.
+- Refusals name their reason: unknown or unregistered repo, the recipient's
+  `messaging` rules, a topic you may not post on, size limits (subject 120
+  characters, body 32 KB), a duplicate send, or the store ceiling.
+- Message bodies are written by another repo, shown inside a
+  `<bridge-message>` block with other repos' paths redacted.
+- Topics: `<repo>/contracts/<domain>`, `<repo>/skills/<name>`,
+  `<repo>/context/<domain>` and `<repo>/manifest` are automatic (the bridge
+  publishes them from real changes; they show in `bridge_changes`). A repo
+  declares its own topics in its manifest:
+  `"topics": { "releases": { "description": "...", "post": "owner" } }`
+  (`post`: `owner`, `subscribers` or `any`); posts on them show in
+  `bridge_inbox`. A repo can limit who messages it with
+  `"messaging": { "accept": [...] }` or `{ "block": [...] }`.
+- Only registered repos can send or receive. `bridge_send_message` still
+  works but is deprecated in favour of `bridge_send`.
 
 If another repo's tool must be run on its files, follow that repo's own
 contract, skill or integration doc. The bridge doesn't hand out paths, so
@@ -294,20 +325,17 @@ bridge_manifest_update({
 
 Write context files for each component. At minimum, fill in Purpose and Exposes.
 
-Optionally declare `watches` so `bridge_changes` filters to relevant updates:
+Optionally subscribe to the changes that matter, so `bridge_changes` filters
+to them:
 
 ```
-bridge_manifest_update({
-  patch: {
-    watches: {
-      "<other-repo>": ["contracts", "schemas"]
-    }
-  }
-})
+bridge_subscribe({ action: "add", topic: "<other-repo>/contracts/*" })
 ```
 
-If no `watches` are declared, `bridge_changes` shows all contract changes from
-other repos as a safe default.
+Patterns use `*` for one segment (`*/skills/*`, `<repo>/context/users`).
+Existing `watches` in a manifest keep working and count as subscriptions. If
+neither is declared, `bridge_changes` shows all contract changes from other
+repos as a safe default; updates to installed skills always show.
 
 ### Step 3 — Register in the ecosystem
 

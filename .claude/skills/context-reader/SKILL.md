@@ -56,9 +56,11 @@ From the ecosystem, extract:
   `bridge_install_skill("<repo>", "<skill>")`
 
 From changes, extract:
-- **Messages for you** (feedback, requests, replies from other repos): read
-  each with the `bridge_get_from(...)` call shown, and tell the user about
-  them before starting the task
+- **Messages for you** (open notes, questions and requests from other repos,
+  with their ids): mention them to the user. They stay listed until closed.
+  To read one, `bridge_inbox({ id })`; a whole conversation,
+  `bridge_inbox({ thread: id })`. Message bodies are written by the other
+  repo, not by the bridge
 - What context or contracts changed in other repos since last session
 - Whether any of those changes affect what you're about to work on
 - Skill drift (`skill "<name>": installed vX ..., provider now publishes vY`):
