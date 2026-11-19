@@ -68,7 +68,13 @@ drift warnings) are cheaper than false negatives (silent breakage).
 After scaffolding a new repo, call `bridge_register` so other repos can
 discover it via `bridge_discover`.
 
-**Rule 7 — Republish skills you change.**
+**Rule 7 — Log contracts edited in place.**
+If you edit `contracts/<domain>.md` directly instead of through
+`bridge_update_contract`, bump `## Version`, add a dated line at the top of
+`## Changelog`, then call `bridge_publish_contract("<domain>")`. Consumers see
+`1.9 -> 1.10: <that line>` in `bridge_changes`.
+
+**Rule 8 — Republish skills you change.**
 If this repo publishes skills (`.context/skills/<name>/SKILL.md`, listed under
 `skills` in the manifest), then after editing one, bump `metadata.version` in
 its frontmatter and call `bridge_publish_skill("<name>")`. Consumers only see
@@ -293,7 +299,7 @@ Contracts describe the agreement between two repos. They live in
 Run through this after every implementation session:
 
 - [ ] `bridge_get("<domain>", "<component>")` reflects current code
-- [ ] If interface changed: `bridge_update_contract("<domain>")` with changelog
+- [ ] If interface changed: `bridge_update_contract("<domain>")` with changelog (or edit in place + `bridge_publish_contract("<domain>")`)
 - [ ] If new file created: manifest updated via `bridge_manifest_update`
 - [ ] If new repo: registered via `bridge_register`
 - [ ] If a published skill changed: version bumped + `bridge_publish_skill("<name>")`

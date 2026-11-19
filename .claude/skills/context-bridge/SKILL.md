@@ -98,7 +98,22 @@ bridge_register({
 })
 ```
 
-### Rule 6 — Share tools as skills, not copies
+### Rule 6 — Talk to other repos with messages
+
+To give feedback, ask for something, or reply to another repo, use
+`bridge_send_message({ to: "<repo>", subject, content, inReplyTo? })`. It
+writes to this repo's `.context/requests/` and the addressee gets it under
+**Messages for you** in `bridge_changes`. Read messages with the
+`bridge_get_from("<sender>", "requests", "<file>")` call that
+`bridge_changes` shows. Never write feedback into ad-hoc folders such as
+`feedback/` or `responses/`, because the addressee never sees them.
+
+If another repo's tool must be run on its files, follow that repo's own
+contract, skill or integration doc. The bridge doesn't hand out paths, so
+if the instructions aren't published, send that repo a message asking for
+them.
+
+### Rule 7 — Share tools as skills, not copies
 
 When a repo offers something other repos should *use* (a CLI, a pipeline),
 it publishes a skill instead of each consumer copying instructions by hand:

@@ -67,10 +67,12 @@ interface Ecosystem {
 interface ChangelogEntry {
   timestamp: string;
   repo: string;
-  type: "context" | "contract" | "manifest" | "skill";
+  type: "context" | "contract" | "manifest" | "skill" | "message";
   domain: string;
   component: string | null;
   summary: string;
+  version?: string;   // contract/skill version this entry published
+  to?: string;        // message addressee (repo name)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -765,48 +767,33 @@ function readInstalledSkills(manifest: Record<string, unknown>): Record<string, 
     : {};
 }
 
-/**
- * Changelog lines for skill versions that differ between two manifests, so a
- * provider's publish shows up in its consumers' bridge_changes.
- */
-function skillVersionChanges(
-  before: Record<string, unknown>,
-  after: Record<string, unknown>
-): Array<{ skill: string; summary: string }> {
-  const versions = (m: Record<string, unknown>): Record<string, string | null> => {
-    const s = m.skills;
-    if (!s || typeof s !== "object" || Array.isArray(s)) return {};
-    return Object.fromEntries(
-      Object.entries(s as Record<string, { version?: unknown }>).map(([k, v]) => [
-        k,
-        typeof v?.version === "string" ? v.version : null,
-      ])
-    );
-  };
-  const old = versions(before);
-  const cur = versions(after);
-  const out: Array<{ skill: string; summary: string }> = [];
-  for (const [skill, version] of Object.entries(cur)) {
-    if (!(skill in old)) {
-      out.push({ skill, summary: `published ${version ?? "(unversioned)"}` });
-    } else if (old[skill] !== version) {
-      out.push({ skill, summary: `${old[skill] ?? "(unversioned)"} -> ${version ?? "(unversioned)"}` });
-    }
-  }
-  for (const skill of Object.keys(old)) {
-    if (!(skill in cur)) out.push({ skill, summary: "unpublished" });
-  }
-  return out;
+/** Skill versions in a manifest's `skills` registry. */
+function manifestSkillVersions(m: Record<string, unknown>): Record<string, string | null> {
+  const s = m.skills;
+  if (!s || typeof s !== "object" || Array.isArray(s)) return {};
+  return Object.fromEntries(
+    Object.entries(s as Record<string, { version?: unknown }>).map(([k, v]) => [
+      k,
+      typeof v?.version === "string" ? v.version : null,
+    ])
+  );
 }
 
+/**
+ * Log skills whose manifest entry changed between two manifests. The "from"
+ * side is the last version actually published (logged), not the old
+ * manifest: the manifest may have been edited by hand since.
+ * Returns the skills that were logged.
+ */
 async function logSkillChanges(
   before: Record<string, unknown>,
   after: Record<string, unknown>
-): Promise<void> {
-  const changes = skillVersionChanges(before, after);
-  if (changes.length === 0) return;
+): Promise<string[]> {
+  const old = manifestSkillVersions(before);
+  const cur = manifestSkillVersions(after);
   const repo = await currentRepoName();
-  for (const { skill, summary } of changes) {
+  const logged: string[] = [];
+  const log = async (skill: string, summary: string, version?: string) => {
     await appendChangelog({
       timestamp: new Date().toISOString(),
       repo,
@@ -814,8 +801,149 @@ async function logSkillChanges(
       domain: skill,
       component: null,
       summary,
+      ...(version ? { version } : {}),
     });
+    logged.push(skill);
+  };
+  for (const [skill, version] of Object.entries(cur)) {
+    if (skill in old && old[skill] === version) continue;
+    const published = await lastLoggedVersion(repo, "skill", skill);
+    if (version !== null && published === version) continue;  // already published
+    const shown = version ?? "(unversioned)";
+    await log(skill, published ? `${published} -> ${shown}` : `published ${shown}`, version ?? undefined);
   }
+  for (const skill of Object.keys(old)) {
+    if (!(skill in cur)) await log(skill, "unpublished");
+  }
+  return logged;
+}
+
+/** Version an entry published. Older entries only state it in the summary. */
+export function entryVersion(e: ChangelogEntry): string | null {
+  if (e.version) return e.version;
+  if (e.type === "skill") {
+    const m = e.summary.match(/^published (\S+)$/) ?? e.summary.match(/-> (\S+)$/);
+    if (m && m[1] !== "(unversioned)") return m[1];
+  }
+  return null;
+}
+
+/**
+ * The version `repo` last logged for a skill or contract, or null when it
+ * never logged one (or last unpublished it).
+ */
+async function lastLoggedVersion(
+  repo: string,
+  type: "skill" | "contract",
+  domain: string
+): Promise<string | null> {
+  const { entries } = await readChangelog();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.repo !== repo || e.type !== type || e.domain !== domain) continue;
+    if (e.summary === "unpublished") return null;
+    const v = entryVersion(e);
+    if (v) return v;
+  }
+  return null;
+}
+
+/** First entry under a contract's `## Changelog` heading (newest first by convention). */
+export function extractNewestChangelogLine(content: string): string | null {
+  const lines = content.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^##\s+changelog\s*$/i.test(l.trim()));
+  if (start === -1) return null;
+  for (const raw of lines.slice(start + 1)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) return null;
+    const text = line.replace(/^([-*+]|\d+[.)])\s+/, "").trim();
+    return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+  }
+  return null;
+}
+
+/** Changelog summary for a contract: "1.9 -> 1.10: <newest changelog line>". */
+export function contractSummary(
+  previous: string | null,
+  content: string
+): { summary: string; version: string | null } {
+  const version = extractVersion(content);
+  if (!version) return { summary: extractSummary(content), version: null };
+  const head =
+    previous === null
+      ? version
+      : previous === version
+        ? `${version} (version unchanged)`
+        : `${previous} -> ${version}`;
+  const note = extractNewestChangelogLine(content);
+  return { summary: note ? `${head}: ${note}` : head, version };
+}
+
+async function logContractChange(
+  domain: string,
+  content: string,
+  previous: string | null
+): Promise<string> {
+  const { summary, version } = contractSummary(previous, content);
+  await appendChangelog({
+    timestamp: new Date().toISOString(),
+    repo: await currentRepoName(),
+    type: "contract",
+    domain,
+    component: null,
+    summary,
+    ...(version ? { version } : {}),
+  });
+  return summary;
+}
+
+// ─── Registration + messages ──────────────────────────────────────────────────
+
+/**
+ * A warning when this repo isn't usable by others: not in the ecosystem, or
+ * registered under a name other than the one its changelog entries use.
+ * Null when all is well (or the ecosystem can't be read).
+ */
+async function registrationNotice(): Promise<string | null> {
+  let eco: Ecosystem;
+  try {
+    eco = await readEcosystem();
+  } catch {
+    return null;
+  }
+  const name = await currentRepoName();
+  if (eco.repos[name]) return null;
+  const own = resolve(CONTEXT_ROOT, "..");
+  const byPath = Object.entries(eco.repos).find(([, e]) => {
+    const local = toLocalPath(e.path);
+    return "path" in local && resolve(local.path) === own;
+  });
+  if (byPath) {
+    return (
+      `⚠ This repo is registered in the ecosystem as "${byPath[0]}", but its manifest calls it "${name}". ` +
+      `Its changelog entries and messages are signed "${name}", so other repos can't link them to it. ` +
+      `Set "project": "${byPath[0]}" with bridge_manifest_update.`
+    );
+  }
+  return (
+    `⚠ This repo ("${name}") is not registered in the ecosystem: other repos can't discover it, read its ` +
+    "contracts or skills, or exchange messages with it. To expose it, ask the user which domains other " +
+    `repos may read, then: bridge_register({ name: "${name}", path: "${own.replace(/\\/g, "\\\\")}", exposes: [...] })`
+  );
+}
+
+function slugify(text: string, max = 50): string {
+  return (
+    text
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, max)
+      .replace(/-+$/, "") || "message"
+  );
 }
 
 // ─── Path redaction ───────────────────────────────────────────────────────────
@@ -981,6 +1109,8 @@ const WATCH_CATEGORY_ALIASES: Record<string, ChangelogEntry["type"]> = {
   manifests: "manifest",
   skill: "skill",
   skills: "skill",
+  message: "message",
+  messages: "message",
 };
 
 export function watchMatchesEntry(
@@ -1088,6 +1218,13 @@ const InstallSkillSchema = z.object({
 
 const UninstallSkillSchema = z.object({
   skill: z.string().min(1),
+});
+
+const SendMessageSchema = z.object({
+  to: z.string().min(1),
+  subject: z.string().min(1),
+  content: z.string().min(1),
+  inReplyTo: z.string().min(1).optional(),
 });
 
 const PublishSkillSchema = z.object({
@@ -1203,7 +1340,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "bridge_update_contract",
       description:
-        "Write or overwrite an API contract file. Use when adding a new endpoint, event shape, or shared type.",
+        "Write or overwrite an API contract file. Use when adding a new endpoint, event shape, or shared type. " +
+        "Logs the change with its version (from ## Version) and newest ## Changelog line, e.g. '1.9 -> 1.10: <line>'.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1211,6 +1349,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           content: { type: "string", description: "Full markdown content" },
         },
         required: ["domain", "content"],
+      },
+    },
+    {
+      name: "bridge_publish_contract",
+      description:
+        "Log a contract you edited in place in contracts/<domain>.md, without resending its content. " +
+        "Records the version change since the last logged version and the newest ## Changelog line, " +
+        "so consumers see it in bridge_changes.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          domain: { type: "string", description: "Contract domain name" },
+        },
+        required: ["domain"],
       },
     },
     {
@@ -1361,6 +1513,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "bridge_send_message",
+      description:
+        "Send a message (feedback, request, reply) to another ecosystem repo. Writes " +
+        ".context/requests/<date>-to-<repo>-<subject>.md in THIS repo and logs it; the addressee sees it " +
+        "under 'Messages for you' in bridge_changes and reads it with bridge_get_from. Use this instead of " +
+        "ad-hoc feedback/requests folders. Both repos must be registered.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Addressee repo name in the ecosystem" },
+          subject: { type: "string", description: "One-line subject; also names the file" },
+          content: { type: "string", description: "Message body (markdown)" },
+          inReplyTo: {
+            type: "string",
+            description: "When replying: the message you answer, as '<repo>/requests/<file>'",
+          },
+        },
+        required: ["to", "subject", "content"],
+      },
+    },
+    {
       name: "bridge_manifest_update",
       description:
         "Deep-merge a patch object into manifest.json. Arrays are replaced wholesale, not appended — " +
@@ -1438,6 +1611,7 @@ async function handleToolCall(
     // ── bridge_manifest ────────────────────────────────────────────────────
     case "bridge_manifest": {
       const manifest = await readManifest();
+      const notice = await registrationNotice();
       return {
         content: [
           {
@@ -1445,6 +1619,7 @@ async function handleToolCall(
             text: JSON.stringify(manifest, null, 2),
             verbatim: true,
           },
+          ...(notice ? [{ type: "text" as const, text: notice }] : []),
         ],
       };
     }
@@ -1744,12 +1919,15 @@ async function handleToolCall(
 
       // List all repos
       const repos = Object.entries(ecosystem.repos);
+      const notice = await registrationNotice();
       if (repos.length === 0) {
         return {
           content: [
             {
               type: "text",
-              text: "No repos registered. Use bridge_register to add repos to the ecosystem.",
+              text:
+                "No repos registered. Use bridge_register to add repos to the ecosystem." +
+                (notice ? `\n\n${notice}` : ""),
             },
           ],
         };
@@ -1773,7 +1951,10 @@ async function handleToolCall(
       }));
       return {
         content: [
-          { type: "text", text: `Ecosystem repos:\n\n${lines.join("\n\n")}` },
+          {
+            type: "text",
+            text: `Ecosystem repos:\n\n${lines.join("\n\n")}${notice ? `\n\n${notice}` : ""}`,
+          },
         ],
       };
     }
@@ -1783,20 +1964,42 @@ async function handleToolCall(
       const { domain, content } = ContractUpdateSchema.parse(args);
       const path = contractPath(domain);
       assertSafePath(path, [CONTRACTS_ROOT]);
+      // The version being replaced: the file on disk, else what was last logged
+      const before = await safeRead(path);
+      const previous =
+        (before !== null ? extractVersion(before) : null) ??
+        (await lastLoggedVersion(await currentRepoName(), "contract", domain));
       await mkdir(CONTRACTS_ROOT, { recursive: true });
       await writeFileAtomic(path, content);
-      await appendChangelog({
-        timestamp: new Date().toISOString(),
-        repo: await currentRepoName(),
-        type: "contract",
-        domain,
-        component: null,
-        summary: extractSummary(content),
-      });
+      const summary = await logContractChange(domain, content, previous);
       return {
         content: [
-          { type: "text", text: `✓ Written: contracts/${domain}.md` },
+          { type: "text", text: `✓ Written: contracts/${domain}.md\n  logged: ${summary}` },
         ],
+      };
+    }
+
+    // ── bridge_publish_contract ────────────────────────────────────────────
+    case "bridge_publish_contract": {
+      const { domain } = ContractGetSchema.parse(args);
+      const path = contractPath(domain);
+      assertSafePath(path, [CONTRACTS_ROOT]);
+      const content = await safeRead(path);
+      if (content === null) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `No contract at contracts/${domain}.md — write it first (or use bridge_update_contract)`
+        );
+      }
+      // Edited in place: the file already holds the new version, so compare
+      // with the last version this repo logged
+      const previous = await lastLoggedVersion(await currentRepoName(), "contract", domain);
+      const summary = await logContractChange(domain, content, previous);
+      const hint = extractVersion(content)
+        ? ""
+        : "\n  ⚠ no ## Version section — consumers can't detect drift for this contract";
+      return {
+        content: [{ type: "text", text: `✓ Logged contracts/${domain}.md: ${summary}${hint}` }],
       };
     }
 
@@ -1864,11 +2067,23 @@ async function handleToolCall(
           : undefined;
       const cursor = since ?? myEntry?.lastCheckedAt ?? "1970-01-01T00:00:00Z";
 
+      const isNew = (e: ChangelogEntry & { line: number }) =>
+        lineCursor !== undefined ? e.line >= lineCursor : e.timestamp > cursor;
+
+      // Messages addressed to this repo always show, watches or not
+      const inbox = allEntries.filter(
+        (e) => e.type === "message" && e.to === repoName && e.repo !== repoName && isNew(e)
+      );
+      const inboxLines = inbox.map(
+        (e) =>
+          `  [${e.timestamp.slice(0, 10)}] from ${e.repo}: "${e.summary}"\n` +
+          `    → bridge_get_from("${e.repo}", "${e.domain}", "${e.component}")`
+      );
+
       const relevant = allEntries.filter((e) => {
         if (e.repo === repoName) return false;
-        if (lineCursor !== undefined ? e.line < lineCursor : e.timestamp <= cursor) {
-          return false;
-        }
+        if (!isNew(e)) return false;
+        if (e.type === "message" && e.to === repoName) return false;  // in the inbox
         // Updates to a skill installed here always matter, watches or not
         if (e.type === "skill" && installedSkills[e.domain]?.from === e.repo) return true;
         if (watches) {
@@ -1886,7 +2101,10 @@ async function handleToolCall(
         const target = e.component
           ? `${e.domain}/${e.component}`
           : e.domain;
-        let line = `  [${date}] ${e.repo} updated ${e.type} "${target}"`;
+        let line =
+          e.type === "message"
+            ? `  [${date}] ${e.repo} sent a message to ${e.to ?? "?"} "${target}"`
+            : `  [${date}] ${e.repo} updated ${e.type} "${target}"`;
         if (e.summary) line += `\n    → ${e.summary}`;
         return line;
       });
@@ -1963,6 +2181,10 @@ async function handleToolCall(
 
       // ── Build response ──
       const sections: string[] = [];
+
+      if (inboxLines.length > 0) {
+        sections.push(`Messages for you (${inboxLines.length}):\n\n${inboxLines.join("\n\n")}`);
+      }
 
       if (driftLines.length > 0) {
         sections.push(
@@ -2153,6 +2375,91 @@ async function handleToolCall(
       };
     }
 
+    // ── bridge_send_message ───────────────────────────────────────────────
+    case "bridge_send_message": {
+      const { to, subject, content, inReplyTo } = SendMessageSchema.parse(args);
+      const from = await currentRepoName();
+      const ecosystem = await readEcosystem();
+      if (!ecosystem.repos[from]) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `This repo ("${from}") is not registered in the ecosystem. The addressee reads messages from the ` +
+            "sender's .context/, so register this repo first with bridge_register."
+        );
+      }
+      if (!ecosystem.repos[to]) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `No repo "${to}" in the ecosystem. Registered: ${Object.keys(ecosystem.repos).join(", ")}`
+        );
+      }
+      if (to === from) {
+        throw new McpError(ErrorCode.InvalidParams, "Cannot send a message to this repo itself");
+      }
+
+      const date = new Date().toISOString().slice(0, 10);
+      const dir = join(CONTEXT_ROOT, "requests");
+      const base = `${date}-to-${slugify(to, 40)}-${slugify(subject)}`;
+      let component = base;
+      for (let n = 2; existsSync(join(dir, `${component}.md`)); n++) component = `${base}-${n}`;
+      const file = join(dir, `${component}.md`);
+      assertSafePath(file, [CONTEXT_ROOT]);
+
+      const header = [
+        `# ${subject.trim()}`,
+        "",
+        `- From: ${from}`,
+        `- To: ${to}`,
+        `- Date: ${date}`,
+        ...(inReplyTo ? [`- In reply to: ${inReplyTo}`] : []),
+      ].join("\n");
+      await mkdir(dir, { recursive: true });
+      await writeFileAtomic(file, `${header}\n\n${content.trim()}\n`);
+
+      // List it in the manifest so the sender's message folder is discoverable
+      const manifest = await readManifest();
+      const domains =
+        manifest.domains && typeof manifest.domains === "object" && !Array.isArray(manifest.domains)
+          ? (manifest.domains as Record<string, unknown>)
+          : {};
+      const listed = Array.isArray(domains.requests) ? (domains.requests as unknown[]) : [];
+      domains.requests = [...listed, component];
+      manifest.domains = domains;
+      await writeManifest(manifest);
+
+      // The convention: a repo that sends messages exposes "requests"
+      let exposedNow = false;
+      await updateEcosystem((eco) => {
+        const entry = eco.repos[from];
+        if (!entry || entry.exposes.includes("requests")) return false;
+        entry.exposes = [...entry.exposes, "requests"];
+        exposedNow = true;
+      });
+
+      await appendChangelog({
+        timestamp: new Date().toISOString(),
+        repo: from,
+        type: "message",
+        domain: "requests",
+        component,
+        summary: subject.trim().slice(0, 120),
+        to,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `✓ Sent to ${to}: .context/requests/${component}.md\n` +
+              `  ${to} sees it under "Messages for you" in bridge_changes and reads it with ` +
+              `bridge_get_from("${from}", "requests", "${component}")` +
+              (exposedNow ? `\n  Added "requests" to ${from}'s exposed domains.` : ""),
+          },
+        ],
+      };
+    }
+
     // ── bridge_publish_skill ──────────────────────────────────────────────
     case "bridge_publish_skill": {
       const { skill, version } = PublishSkillSchema.parse(args);
@@ -2190,17 +2497,31 @@ async function handleToolCall(
       }
       const next = deepMerge(current, { skills: { [skill]: entry } });
       await writeManifest(next);
-      await logSkillChanges(current, next);
+
+      // Compare with what was last *published* (the changelog), not the
+      // manifest: a hand-edited manifest must not swallow a publish.
+      const repoName = await currentRepoName();
+      const published = await lastLoggedVersion(repoName, "skill", skill);
+      const changed = published !== publishVersion;
+      if (changed) {
+        await appendChangelog({
+          timestamp: new Date().toISOString(),
+          repo: repoName,
+          type: "skill",
+          domain: skill,
+          component: null,
+          summary: published ? `${published} -> ${publishVersion}` : `published ${publishVersion}`,
+          version: publishVersion,
+        });
+      }
 
       const warnings: string[] = [];
-      const repoName = await currentRepoName();
       const me = (await readEcosystem()).repos[repoName];
       if (!me) {
         warnings.push(`⚠ "${repoName}" is not registered in the ecosystem — run bridge_register so other repos can find it`);
       } else if (!me.exposes.includes("skills")) {
         warnings.push(`⚠ "${repoName}" does not expose "skills" — re-run bridge_register with "skills" in exposes`);
       }
-      const changed = skillVersionChanges(current, next).length > 0;
       const head = changed
         ? `✓ Published skill "${skill}" v${publishVersion}`
         : `✓ Skill "${skill}" already published at v${publishVersion} — bump the version so consumers see changes`;

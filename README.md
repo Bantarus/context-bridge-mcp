@@ -142,13 +142,15 @@ another repo and reads its `.context/` folder.
 | `bridge_register` | Register a repo in the shared ecosystem |
 | `bridge_discover` | List or inspect repos in the ecosystem, with the skills they publish |
 | `bridge_get_contract` | Fetch a contract — searches local then ecosystem |
-| `bridge_update_contract` | Write a contract file |
+| `bridge_update_contract` | Write a contract file (logged with its version change) |
+| `bridge_publish_contract` | Log a contract edited in place, without resending it |
 | `bridge_list_contracts` | List all contracts |
 | `bridge_changes` | Show changes from other repos since last check, plus contract and skill drift |
 | `bridge_sync_skills` | Install/update companion skills and every skill installed from other repos |
 | `bridge_install_skill` | Install a skill another repo publishes into `.claude/skills/` |
 | `bridge_uninstall_skill` | Remove a skill installed with `bridge_install_skill` |
 | `bridge_publish_skill` | Publish (or re-publish) a skill from `.context/skills/<name>/` |
+| `bridge_send_message` | Send feedback, a request or a reply to another repo |
 | `bridge_manifest_update` | Deep-merge a patch into manifest.json |
 
 ---
@@ -401,6 +403,35 @@ Version drift detected (1):
 This means the agent knows exactly what changed and can re-fetch the contract
 to understand the delta before writing any code against a stale interface.
 
+Contract changelog entries record the version move and the newest line of
+the contract's `## Changelog` section, for example
+`1.9 -> 1.10: recall --from <path> without a shard`. If you edit a contract
+file in place, log it with `bridge_publish_contract("<domain>")` instead
+of resending the whole file through `bridge_update_contract`.
+
+### Messages between repos
+
+Feedback, requests and replies between projects go through one convention:
+
+```
+bridge_send_message({ to: "vessel", subject: "Reading another project's shard", content: "..." })
+```
+
+- The message is written to **the sender's** `.context/requests/` as
+  `<date>-to-<repo>-<subject>.md`. The file starts with the subject as its
+  title, followed by `From`, `To`, `Date` and optionally `In reply to`.
+- The sender's `requests` domain is listed in its manifest and added to its
+  exposed domains, so other repos can read it.
+- The addressee sees it at the top of `bridge_changes`, under
+  **Messages for you**, whatever its `watches` say. It reads the message
+  with `bridge_get_from("<sender>", "requests", "<file>")`.
+- To reply, call `bridge_send_message` back, with
+  `inReplyTo: "<repo>/requests/<file>"`.
+
+Both repos must be registered. Use `requests` for these messages; don't
+create separate `feedback/`, `responses/` or `proposals/` folders, because
+nothing in them reaches the addressee.
+
 ### Sharing skills between repos
 
 A repo can publish Claude Code skills that teach other repos' agents to use
@@ -483,6 +514,19 @@ Documents are the exception. Context files, contracts, manifests and skills
 are returned exactly as their owner wrote them. If a provider's contract
 gives consumers an absolute path to run its CLI, that path is the
 provider's choice and comes through.
+
+**Repos in different environments.** Repos can live on the Windows host
+and in several WSL distros. Agents never need a path to work with each
+other's `.context/`, because the bridge translates the location for its
+own environment. To let other projects run a tool that lives in its repo
+(a CLI, a shard), a repo publishes the reading or calling instructions in
+its own contract, skill or integration doc. That way the owner decides what
+to share. Give both forms, because the caller may be on either side:
+- From Windows: `wsl.exe -d <Distro> --cd <path in the distro> -- <command>`,
+  or read files through `\\wsl.localhost\<Distro>\...`.
+- From WSL: Windows drives are under `/mnt/<drive>/...`, and other
+  distros under `/mnt/wsl/<Distro>/...` when that distro is bind-mounted (see
+  below).
 
 This removes the pointers, but it isn't a sandbox. An agent with
 unrestricted `Read`/`Bash` can still open `ecosystem.json` or search the

@@ -39,6 +39,11 @@ bridge_discover()
 bridge_changes()
 ```
 
+If `bridge_manifest` warns that this repo is not registered (or is
+registered under another name), tell the user. Other repos can't see it until
+it's fixed, so don't register it on your own without asking which domains to
+expose.
+
 From the manifest, extract:
 - What domains exist in this repo
 - What the project is and its stack
@@ -51,6 +56,9 @@ From the ecosystem, extract:
   `bridge_install_skill("<repo>", "<skill>")`
 
 From changes, extract:
+- **Messages for you** (feedback, requests, replies from other repos): read
+  each with the `bridge_get_from(...)` call shown, and tell the user about
+  them before starting the task
 - What context or contracts changed in other repos since last session
 - Whether any of those changes affect what you're about to work on
 - Skill drift (`skill "<name>": installed vX ..., provider now publishes vY`):
